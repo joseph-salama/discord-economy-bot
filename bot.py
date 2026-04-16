@@ -8,26 +8,32 @@ import random
 import string
 from datetime import datetime, timezone, timedelta
 import traceback
+import re
 
 # ─────────────────────────────────────────────
 # CONFIGURATION VARIABLES
 # ─────────────────────────────────────────────
 CURRENCY_NAME = "Wok"
 CURRENCY_SYMBOL = "元"
+ALLOWED_CHANNEL_ID = 0  # Set this to the channel ID where commands should work. 0 disables the restriction.
 DAILY_AMOUNT = 50
-STARTING_BALANCE = 250
+STARTING_BALANCE = 0
 MIN_BATTLE_WAGER = 100
 CHALLENGE_TIMEOUT_SECONDS = 300
 MODERATOR_ROLE_ID = 1494455406691483658
 LOG_CHANNEL_ID = 1494449437240463451
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+QUEUE_CHANNEL_IDS = {1478102174541025451, 989621653703098398}  # queue-4mans, queue-6mans
+MATCH_REWARD = 100  # Currency granted to each player when teams are created
+TOP_PAGE_SIZE = 8
 
 # ─────────────────────────────────────────────
 # BOT SETUP
 # ─────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 bot = discord.Bot(intents=intents)
 db_pool: asyncpg.Pool = None
 
@@ -38,14 +44,18 @@ db_pool: asyncpg.Pool = None
 def fmt(amount: int) -> str:
     return f"{CURRENCY_SYMBOL}{amount}"
 
+
 def gen_id(length=5) -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def fmt_user(user: discord.User | discord.Member) -> str:
     return f"{user.name}#{user.discriminator}" if user.discriminator != "0" else user.name
+
 
 def ts() -> str:
     return now_utc().strftime("%Y-%m-%d %H:%M:%S")
@@ -119,6 +129,64 @@ def has_mod_role(ctx: discord.ApplicationContext) -> bool:
     if isinstance(ctx.author, discord.Member):
         return any(r.id == MODERATOR_ROLE_ID for r in ctx.author.roles)
     return False
+
+
+async def enforce_channel(ctx: discord.ApplicationContext) -> bool:
+    """Restrict slash commands to a single channel, except logs still go to the log channel."""
+    if ALLOWED_CHANNEL_ID and ctx.channel_id != ALLOWED_CHANNEL_ID:
+        allowed_mention = f"<#{ALLOWED_CHANNEL_ID}>"
+        await ctx.respond(
+            f"This bot only works in {allowed_mention}.",
+            ephemeral=True
+        )
+        return False
+    return True
+
+
+async def get_display_name(user_id: str) -> str:
+    try:
+        user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+        return user.display_name if hasattr(user, "display_name") else user.name
+    except Exception:
+        return f"User {user_id}"
+
+
+async def build_top_embed(page: int) -> tuple[discord.Embed, int]:
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
+        total_pages = max(1, (total_users + TOP_PAGE_SIZE - 1) // TOP_PAGE_SIZE)
+        page = max(1, min(page, total_pages))
+        offset = (page - 1) * TOP_PAGE_SIZE
+
+        rows = await conn.fetch(
+            """
+            SELECT user_id, balance, escrow
+            FROM users
+            ORDER BY balance DESC, user_id ASC
+            LIMIT $1 OFFSET $2
+            """,
+            TOP_PAGE_SIZE, offset
+        )
+
+    embed = discord.Embed(
+        title=f"🏆 {CURRENCY_NAME} Leaderboard",
+        color=discord.Color.gold()
+    )
+
+    if not rows:
+        embed.description = f"No one has any {CURRENCY_NAME} yet."
+    else:
+        lines = []
+        for index, row in enumerate(rows, start=offset + 1):
+            name = await get_display_name(row["user_id"])
+            available = row["balance"] - row["escrow"]
+            lines.append(
+                f"**#{index}** {name} — Total: {fmt(row['balance'])} | Available: {fmt(available)}"
+            )
+        embed.description = "\n".join(lines)
+
+    embed.set_footer(text=f"Page {page}/{total_pages} • {TOP_PAGE_SIZE} per page")
+    return embed, total_pages
 
 
 # ─────────────────────────────────────────────
@@ -308,15 +376,60 @@ class ChallengeView(discord.ui.View):
         await log(f"❌ BATTLE DECLINED — Match ID: {self.match_id} | Declined by: {fmt_user(interaction.user)} | Wager refunded: {fmt(match['wager_amount'])}")
 
 
+class TopLeaderboardView(discord.ui.View):
+    def __init__(self, author_id: int, page: int = 1):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.page = page
+        self.total_pages = 1
+
+    async def refresh_buttons(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id == "top_prev":
+                    child.disabled = self.page <= 1
+                elif child.custom_id == "top_next":
+                    child.disabled = self.page >= self.total_pages
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who used /top can change pages.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary, custom_id="top_prev")
+    async def previous_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.page -= 1
+        embed, self.total_pages = await build_top_embed(self.page)
+        self.page = max(1, min(self.page, self.total_pages))
+        await self.refresh_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="top_next")
+    async def next_page(self, button: discord.ui.Button, interaction: discord.Interaction):
+        self.page += 1
+        embed, self.total_pages = await build_top_embed(self.page)
+        self.page = max(1, min(self.page, self.total_pages))
+        await self.refresh_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+
 # ─────────────────────────────────────────────
 # COMMANDS
 # ─────────────────────────────────────────────
 
-@bot.slash_command(description="Challenge another player to a Wok battle")
+@bot.slash_command(description=f"Challenge another player to a {CURRENCY_NAME} battle")
 @option("opponent", discord.Member, description="The player you want to challenge")
-@option("amount", int, description="Wager amount in Wok")
+@option("amount", int, description=f"Wager amount in {CURRENCY_NAME}")
 async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amount: int):
     try:
+        if not await enforce_channel(ctx):
+            return
         await ctx.defer()
         if amount < MIN_BATTLE_WAGER:
             return await ctx.respond(f"The minimum battle wager is {fmt(MIN_BATTLE_WAGER)}.", ephemeral=True)
@@ -364,7 +477,7 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
 
         await log(f"⚔️ BATTLE CREATED — Challenger: {fmt_user(ctx.author)} vs Opponent: {fmt_user(opponent)} | Wager: {fmt(amount)} | Match ID: {match_id}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong. Please try again.", ephemeral=True)
         await log(f"❌ ERROR — Command: /battle | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -373,6 +486,8 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
 @option("match_id", str, description="The match ID to start")
 async def start(ctx: discord.ApplicationContext, match_id: str):
     try:
+        if not await enforce_channel(ctx):
+            return
         match_id = match_id.upper()
         async with db_pool.acquire() as conn:
             await ensure_user(conn, ctx.author.id)
@@ -396,7 +511,7 @@ async def start(ctx: discord.ApplicationContext, match_id: str):
         await ctx.respond(embed=embed)
         await log(f"🥊 MATCH STARTED — Match ID: {match_id} | Started by: {fmt_user(ctx.author)}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /start | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -406,6 +521,8 @@ async def start(ctx: discord.ApplicationContext, match_id: str):
 @option("winner", discord.Member, description="The winner of the match")
 async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord.Member):
     try:
+        if not await enforce_channel(ctx):
+            return
         match_id = match_id.upper()
         async with db_pool.acquire() as conn:
             await ensure_user(conn, ctx.author.id)
@@ -427,7 +544,7 @@ async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord
             await run_payout(conn, match_id, str(winner.id), ctx.channel)
             await ctx.respond(f"Match `{match_id}` has been completed!", ephemeral=True)
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /report | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -438,6 +555,8 @@ async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord
 @option("amount", int, description="Amount to bet")
 async def bet(ctx: discord.ApplicationContext, match_id: str, player: discord.Member, amount: int):
     try:
+        if not await enforce_channel(ctx):
+            return
         match_id = match_id.upper()
         if amount <= 0:
             return await ctx.respond("Bet amount must be greater than zero.", ephemeral=True)
@@ -483,7 +602,7 @@ async def bet(ctx: discord.ApplicationContext, match_id: str, player: discord.Me
         await ctx.respond(embed=embed)
         await log(f"🎲 BET PLACED — {fmt_user(ctx.author)} bet {fmt(amount)} on {fmt_user(player)} | Match: {match_id} | Bet ID: {bet_id}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /bet | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -492,6 +611,8 @@ async def bet(ctx: discord.ApplicationContext, match_id: str, player: discord.Me
 @option("user", discord.Member, description="User to check (defaults to you)", required=False)
 async def balance(ctx: discord.ApplicationContext, user: discord.Member = None):
     try:
+        if not await enforce_channel(ctx):
+            return
         target = user or ctx.author
         async with db_pool.acquire() as conn:
             await ensure_user(conn, target.id)
@@ -504,7 +625,7 @@ async def balance(ctx: discord.ApplicationContext, user: discord.Member = None):
         embed.add_field(name="Total", value=fmt(row["balance"]), inline=True)
         await ctx.respond(embed=embed)
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /balance | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -512,6 +633,8 @@ async def balance(ctx: discord.ApplicationContext, user: discord.Member = None):
 @bot.slash_command(description=f"Claim your daily {fmt(DAILY_AMOUNT)} {CURRENCY_NAME}")
 async def daily(ctx: discord.ApplicationContext):
     try:
+        if not await enforce_channel(ctx):
+            return
         async with db_pool.acquire() as conn:
             await ensure_user(conn, ctx.author.id)
             row = await get_user(conn, ctx.author.id)
@@ -541,15 +664,34 @@ async def daily(ctx: discord.ApplicationContext):
         await ctx.respond(embed=embed)
         await log(f"☀️ DAILY CLAIMED — {fmt_user(ctx.author)} received {fmt(DAILY_AMOUNT)} | New balance: {fmt(updated['balance'])}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /daily | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
+@bot.slash_command(description="Show the leaderboard from most money to least")
+@option("page", int, description="Page number", required=False)
+async def top(ctx: discord.ApplicationContext, page: int = 1):
+    try:
+        if not await enforce_channel(ctx):
+            return
+        page = max(1, page)
+        view = TopLeaderboardView(ctx.author.id, page)
+        embed, view.total_pages = await build_top_embed(page)
+        view.page = max(1, min(page, view.total_pages))
+        await view.refresh_buttons()
+        await ctx.respond(embed=embed, view=view)
+    except Exception:
+        await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /top | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
 @bot.slash_command(description="Cancel a battle you created (before it's accepted)")
 @option("match_id", str, description="The match ID to cancel")
 async def cancelbattle(ctx: discord.ApplicationContext, match_id: str):
     try:
+        if not await enforce_channel(ctx):
+            return
         match_id = match_id.upper()
         async with db_pool.acquire() as conn:
             await ensure_user(conn, ctx.author.id)
@@ -580,7 +722,7 @@ async def cancelbattle(ctx: discord.ApplicationContext, match_id: str):
         await ctx.respond(f"Battle `{match_id}` cancelled and your wager of {fmt(match['wager_amount'])} has been refunded.", ephemeral=True)
         await log(f"🚫 BATTLE CANCELLED — Match ID: {match_id} | Cancelled by: {fmt_user(ctx.author)} | Wager refunded: {fmt(match['wager_amount'])}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /cancelbattle | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -589,6 +731,8 @@ async def cancelbattle(ctx: discord.ApplicationContext, match_id: str):
 @option("match_id", str, description="The match ID your bet is on")
 async def cancelbet(ctx: discord.ApplicationContext, match_id: str):
     try:
+        if not await enforce_channel(ctx):
+            return
         match_id = match_id.upper()
         async with db_pool.acquire() as conn:
             await ensure_user(conn, ctx.author.id)
@@ -611,7 +755,7 @@ async def cancelbet(ctx: discord.ApplicationContext, match_id: str):
         await ctx.respond(f"Your bet of {fmt(existing_bet['amount'])} on match `{match_id}` has been cancelled and refunded.", ephemeral=True)
         await log(f"🚫 BET CANCELLED — {fmt_user(ctx.author)} cancelled bet of {fmt(existing_bet['amount'])} on match {match_id} | Refunded")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /cancelbet | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -621,6 +765,8 @@ async def cancelbet(ctx: discord.ApplicationContext, match_id: str):
 @option("amount", int, description="Amount to add (positive) or remove (negative)")
 async def adjustbalance(ctx: discord.ApplicationContext, user: discord.Member, amount: int):
     try:
+        if not await enforce_channel(ctx):
+            return
         if not has_mod_role(ctx):
             return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
 
@@ -640,7 +786,7 @@ async def adjustbalance(ctx: discord.ApplicationContext, user: discord.Member, a
         )
         await log(f"🔧 BALANCE ADJUSTED — Mod: {fmt_user(ctx.author)} | User: {fmt_user(user)} | Change: {fmt(actual_change)}{note} | New balance: {fmt(new_balance)}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /adjustbalance | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
@@ -650,6 +796,8 @@ async def adjustbalance(ctx: discord.ApplicationContext, user: discord.Member, a
 @option("winner", discord.Member, description="Declare the winner")
 async def resolve(ctx: discord.ApplicationContext, match_id: str, winner: discord.Member):
     try:
+        if not await enforce_channel(ctx):
+            return
         if not has_mod_role(ctx):
             return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
 
@@ -671,9 +819,102 @@ async def resolve(ctx: discord.ApplicationContext, match_id: str, winner: discor
         await ctx.respond(f"Match `{match_id}` has been force-resolved.", ephemeral=True)
         await log(f"🔧 MATCH FORCE-RESOLVED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | Winner: {fmt_user(winner)}")
 
-    except Exception as e:
+    except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /resolve | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
+# ─────────────────────────────────────────────
+# QUEUE MATCH REWARD
+# ─────────────────────────────────────────────
+def parse_team_mentions(content: str) -> list[int]:
+    """
+    Parse all player IDs from Team 1 / Team 2 sections of the queue bot message.
+    Returns a flat list of unique user IDs, or empty list if no teams found.
+    """
+    team_section = re.search(
+        r"Team 1\s*\n([\s\S]*?)Team 2\s*\n([\s\S]*?)(?:Match ID|$)",
+        content,
+        re.IGNORECASE
+    )
+    if not team_section:
+        return []
+
+    team1_block = team_section.group(1)
+    team2_block = team_section.group(2)
+
+    ids = []
+    for block in (team1_block, team2_block):
+        ids.extend(int(m) for m in re.findall(r"<@!?(\d+)>", block))
+
+    return list(dict.fromkeys(ids))
+
+
+async def reward_queue_match(message: discord.Message):
+    """Credit MATCH_REWARD currency to every player in the teams, once per message ID."""
+    if message.channel.id not in QUEUE_CHANNEL_IDS:
+        return
+    if not message.author.bot:
+        return
+
+    content = message.content or ""
+    if not content:
+        for embed in message.embeds:
+            content += f"\n{embed.description or ''}"
+            for field in embed.fields:
+                content += f"\n{field.name}\n{field.value}"
+
+    player_ids = parse_team_mentions(content)
+    if not player_ids:
+        return
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS rewarded_queue_messages (
+                message_id TEXT PRIMARY KEY,
+                rewarded_at TIMESTAMPTZ NOT NULL
+            )
+        """)
+        already = await conn.fetchrow(
+            "SELECT 1 FROM rewarded_queue_messages WHERE message_id = $1",
+            str(message.id)
+        )
+        if already:
+            return
+
+        await conn.execute(
+            "INSERT INTO rewarded_queue_messages (message_id, rewarded_at) VALUES ($1, $2)",
+            str(message.id), now_utc()
+        )
+
+        rewarded_tags = []
+        for uid in player_ids:
+            await ensure_user(conn, uid)
+            await credit(conn, uid, MATCH_REWARD, f"queue match reward (msg {message.id})")
+            try:
+                user = await bot.fetch_user(uid)
+                rewarded_tags.append(fmt_user(user))
+            except Exception:
+                rewarded_tags.append(str(uid))
+
+    await log(
+        f"🎮 QUEUE MATCH REWARD — {fmt(MATCH_REWARD)} granted to {len(player_ids)} players "
+        f"in #{message.channel.name}: {', '.join(rewarded_tags)}"
+    )
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if db_pool is None:
+        return
+    await reward_queue_match(message)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if db_pool is None:
+        return
+    await reward_queue_match(after)
 
 
 # ─────────────────────────────────────────────
