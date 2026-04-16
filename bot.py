@@ -15,7 +15,7 @@ import re
 # ─────────────────────────────────────────────
 CURRENCY_NAME = "Wok"
 CURRENCY_SYMBOL = "元"
-ALLOWED_CHANNEL_ID = 0  # Set this to the channel ID where commands should work. 0 disables the restriction.
+ALLOWED_CHANNEL_ID = 1494473065281617971  # Set this to the channel ID where commands should work. 0 disables the restriction.
 DAILY_AMOUNT = 50
 STARTING_BALANCE = 0
 MIN_BATTLE_WAGER = 100
