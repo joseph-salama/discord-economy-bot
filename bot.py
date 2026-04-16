@@ -430,13 +430,14 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
     try:
         if not await enforce_channel(ctx):
             return
-        await ctx.defer()
         if amount < MIN_BATTLE_WAGER:
             return await ctx.respond(f"The minimum battle wager is {fmt(MIN_BATTLE_WAGER)}.", ephemeral=True)
         if opponent.id == ctx.author.id:
             return await ctx.respond("You cannot battle yourself.", ephemeral=True)
         if opponent.bot:
             return await ctx.respond("You cannot battle a bot.", ephemeral=True)
+
+        await ctx.defer()
 
         async with db_pool.acquire() as conn:
             await ensure_user(conn, ctx.author.id)
@@ -471,9 +472,8 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
 
         view = ChallengeView(match_id, ctx.author.id, opponent.id)
         msg = await ctx.respond(embed=embed, view=view)
-        fetched = await msg.original_response()
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(fetched.id), match_id)
+            await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
 
         await log(f"⚔️ BATTLE CREATED — Challenger: {fmt_user(ctx.author)} vs Opponent: {fmt_user(opponent)} | Wager: {fmt(amount)} | Match ID: {match_id}")
 
@@ -542,7 +542,7 @@ async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord
             )
             await ctx.defer()
             await run_payout(conn, match_id, str(winner.id), ctx.channel)
-            await ctx.respond(f"Match `{match_id}` has been completed!", ephemeral=True)
+            await ctx.send_followup(f"Match `{match_id}` has been completed!", ephemeral=True)
 
     except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
@@ -816,7 +816,7 @@ async def resolve(ctx: discord.ApplicationContext, match_id: str, winner: discor
             await ctx.defer()
             await run_payout(conn, match_id, str(winner.id), ctx.channel, mod_tag=fmt_user(ctx.author))
 
-        await ctx.respond(f"Match `{match_id}` has been force-resolved.", ephemeral=True)
+        await ctx.send_followup(f"Match `{match_id}` has been force-resolved.", ephemeral=True)
         await log(f"🔧 MATCH FORCE-RESOLVED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | Winner: {fmt_user(winner)}")
 
     except Exception:
