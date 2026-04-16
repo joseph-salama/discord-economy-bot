@@ -13,9 +13,10 @@ import re
 # ─────────────────────────────────────────────
 # CONFIGURATION VARIABLES
 # ─────────────────────────────────────────────
-CURRENCY_NAME = "Wok"
-CURRENCY_SYMBOL = "元"
-ALLOWED_CHANNEL_ID = 1494473065281617971  # Set this to the channel ID where commands should work. 0 disables the restriction.
+CURRENCY_NAME = "Percent"
+CURRENCY_SYMBOL = "%"
+ALLOWED_CHANNEL_ID = 1494473065281617971 # Set this to the channel ID where commands should work. 0 disables the restriction.
+COMMAND_GUILD_IDS = []  # Put your server ID here, like [123456789012345678], for instant slash command updates while testing.
 DAILY_AMOUNT = 50
 STARTING_BALANCE = 0
 MIN_BATTLE_WAGER = 100
@@ -34,7 +35,7 @@ TOP_PAGE_SIZE = 8
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = discord.Bot(intents=intents)
+bot = discord.Bot(intents=intents, debug_guilds=COMMAND_GUILD_IDS if COMMAND_GUILD_IDS else None)
 db_pool: asyncpg.Pool = None
 
 
@@ -232,6 +233,11 @@ async def on_ready():
             )
         """)
     print(f"✅ Logged in as {bot.user} | DB connected")
+    try:
+        synced = await bot.sync_commands()
+        print(f"🔄 Synced {len(synced)} slash commands")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
     await log(f"🤖 Bot started and ready — {bot.user}")
 
 
