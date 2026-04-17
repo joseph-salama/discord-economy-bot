@@ -237,6 +237,25 @@ async def build_cancelled_match_embed(description: str) -> discord.Embed:
     )
 
 
+async def find_open_match_between(conn, user_one_id: int, user_two_id: int) -> asyncpg.Record | None:
+    """Return any unresolved match between two users, regardless of who challenged whom."""
+    return await conn.fetchrow(
+        """
+        SELECT *
+        FROM matches
+        WHERE (
+            (challenger_id = $1 AND opponent_id = $2)
+            OR
+            (challenger_id = $2 AND opponent_id = $1)
+        )
+        AND status IN ('PENDING', 'ACCEPTED', 'ACTIVE')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        str(user_one_id), str(user_two_id)
+    )
+
+
 # ─────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────
@@ -717,6 +736,14 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
             challenger_row = await get_user(conn, ctx.author.id)
             opponent_row = await get_user(conn, opponent.id)
 
+            existing_match = await find_open_match_between(conn, ctx.author.id, opponent.id)
+            if existing_match:
+                return await ctx.followup.send(
+                    f"You already have an open battle with {opponent.mention} (match `{existing_match['match_id']}`, status: {existing_match['status']}). "
+                    "You can start battles with other people, but only one unresolved battle is allowed per pair until it is completed, declined, cancelled, or times out.",
+                    ephemeral=True
+                )
+
             if await spendable(challenger_row) < amount:
                 return await ctx.respond(f"You have insufficient funds. You need {fmt(amount)} but only have {fmt(await spendable(challenger_row))} available.", ephemeral=True)
             if await spendable(opponent_row) < amount:
@@ -782,6 +809,15 @@ async def forcebattle(ctx: discord.ApplicationContext, player_one: discord.Membe
             await ensure_user(conn, player_two.id)
             player_one_row = await get_user(conn, player_one.id)
             player_two_row = await get_user(conn, player_two.id)
+
+            existing_match = await find_open_match_between(conn, player_one.id, player_two.id)
+            if existing_match:
+                return await ctx.followup.send(
+                    f"{player_one.mention} and {player_two.mention} already have an open battle (match `{existing_match['match_id']}`, status: {existing_match['status']}). "
+                    "Only one unresolved battle is allowed between the same two users at a time.",
+                    ephemeral=True
+                )
+
             player_one_available = await spendable(player_one_row)
             player_two_available = await spendable(player_two_row)
 
