@@ -509,6 +509,27 @@ class MatchReportView(discord.ui.View):
         self.challenger_id = challenger_id
         self.opponent_id = opponent_id
 
+        challenger_user = bot.get_user(challenger_id)
+        opponent_user = bot.get_user(opponent_id)
+        challenger_label = f"{challenger_user.name}" if challenger_user else "Challenger"
+        opponent_label = f"{opponent_user.name}" if opponent_user else "Opponent"
+
+        challenger_button = discord.ui.Button(
+            label=f"{challenger_label} Won",
+            style=discord.ButtonStyle.success,
+            emoji="🏆"
+        )
+        challenger_button.callback = self.challenger_won
+        self.add_item(challenger_button)
+
+        opponent_button = discord.ui.Button(
+            label=f"{opponent_label} Won",
+            style=discord.ButtonStyle.success,
+            emoji="🏆"
+        )
+        opponent_button.callback = self.opponent_won
+        self.add_item(opponent_button)
+
     async def complete_match(self, interaction: discord.Interaction, winner_id: int):
         if interaction.user.id not in (self.challenger_id, self.opponent_id):
             return await interaction.response.send_message("Only one of the two players can report the winner.", ephemeral=True)
@@ -546,12 +567,10 @@ class MatchReportView(discord.ui.View):
         await update_match_message(self.match_id, embed, view=None)
         await interaction.followup.send(f"Match `{self.match_id}` has been completed!", ephemeral=True)
 
-    @discord.ui.button(label="Challenger Won", style=discord.ButtonStyle.success, emoji="🏆")
-    async def challenger_won(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def challenger_won(self, interaction: discord.Interaction):
         await self.complete_match(interaction, self.challenger_id)
 
-    @discord.ui.button(label="Opponent Won", style=discord.ButtonStyle.success, emoji="🏆")
-    async def opponent_won(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def opponent_won(self, interaction: discord.Interaction):
         await self.complete_match(interaction, self.opponent_id)
 
 
