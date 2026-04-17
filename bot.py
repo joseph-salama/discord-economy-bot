@@ -209,6 +209,34 @@ async def update_match_message(match_id: str, embed: discord.Embed, view: discor
         pass
 
 
+async def build_accepted_match_embed(match_id: str, challenger_id: int, opponent_id: int, wager_amount: int, accepted_by_text: str | None = None) -> discord.Embed:
+    challenger = await bot.fetch_user(challenger_id)
+    opponent = await bot.fetch_user(opponent_id)
+    embed = discord.Embed(
+        title="⚔️ Challenge Accepted!",
+        description=f"{challenger.mention} vs {opponent.mention}",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="Wager", value=fmt(wager_amount), inline=True)
+    embed.add_field(name="Match ID", value=match_id, inline=True)
+    embed.add_field(
+        name="Status",
+        value="Bets are now open! Use `/bet` to wager on a player.\nWhen ready, either player or a moderator can press **Start Match** below or use `/start`.",
+        inline=False
+    )
+    if accepted_by_text:
+        embed.set_footer(text=accepted_by_text)
+    return embed
+
+
+async def build_cancelled_match_embed(description: str) -> discord.Embed:
+    return discord.Embed(
+        title="❌ Battle Cancelled",
+        description=description,
+        color=discord.Color.dark_gray()
+    )
+
+
 # ─────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────
@@ -464,8 +492,10 @@ class MatchStartView(discord.ui.View):
 
     @discord.ui.button(label="Start Match", style=discord.ButtonStyle.primary, emoji="▶️")
     async def start_match(self, button: discord.ui.Button, interaction: discord.Interaction):
-        if interaction.user.id not in (self.challenger_id, self.opponent_id):
-            return await interaction.response.send_message("Only one of the two players can start this match.", ephemeral=True)
+        member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+        is_mod = bool(member and any(r.id == MODERATOR_ROLE_ID for r in member.roles))
+        if interaction.user.id not in (self.challenger_id, self.opponent_id) and not is_mod:
+            return await interaction.response.send_message("Only one of the two players or a moderator can start this match.", ephemeral=True)
 
         async with db_pool.acquire() as conn:
             match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
@@ -621,6 +651,50 @@ class TopLeaderboardView(discord.ui.View):
 # COMMANDS
 # ─────────────────────────────────────────────
 
+
+@bot.slash_command(description="Show all commands available to you")
+async def help(ctx: discord.ApplicationContext):
+    try:
+        if not await enforce_channel(ctx):
+            return
+
+        commands_list = [
+            "**/battle** — Challenge another player to a battle.",
+            "**/start** — Start an accepted match.",
+            "**/report** — Report the winner of your active match.",
+            "**/bet** — Bet on a player in an accepted match.",
+            "**/balance** — Check your balance or another user's balance.",
+            f"**/daily** — Claim your daily {fmt(DAILY_AMOUNT)} {CURRENCY_NAME}.",
+            "**/top** — View the money leaderboard.",
+            "**/cancelbattle** — Cancel a pending battle you created.",
+            "**/cancelbet** — Cancel your pending bet before the match starts.",
+        ]
+
+        if has_mod_role(ctx):
+            commands_list.extend([
+                "**/reset** — [MOD] Reset a user's balance and escrow to 0.",
+                "**/adjustbalance** — [MOD] Add or remove from a user's balance.",
+                "**/resolve** — [MOD] Force-resolve a match.",
+                "**/forcebattle** — [MOD] Create a battle for two users without needing acceptance.",
+                "**/forceaccept** — [MOD] Accept a pending battle for the users.",
+                "**/forcecancel** — [MOD] Cancel a pending battle for the users.",
+            ])
+
+        embed = discord.Embed(
+            title="📖 Help",
+            description="Here are the commands available to you:",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="Commands", value="\n".join(commands_list), inline=False)
+        embed.set_footer(text="This message is only visible to you.")
+
+        await ctx.respond(embed=embed, ephemeral=True)
+
+    except Exception:
+        await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /help | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
 @bot.slash_command(description=f"Challenge another player to a {CURRENCY_NAME} battle")
 @option("opponent", discord.Member, description="The player you want to challenge")
 @option("amount", int, description=f"Wager amount in {CURRENCY_NAME}")
@@ -684,6 +758,94 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
         await log(f"❌ ERROR — Command: /battle | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
+@bot.slash_command(description="[MOD] Force-create a battle between two users")
+@option("player_one", discord.Member, description="The first player")
+@option("player_two", discord.Member, description="The second player")
+@option("amount", int, description=f"Wager amount in {CURRENCY_NAME}")
+async def forcebattle(ctx: discord.ApplicationContext, player_one: discord.Member, player_two: discord.Member, amount: int):
+    try:
+        if not await enforce_channel(ctx):
+            return
+        if not has_mod_role(ctx):
+            return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+        if amount < MIN_BATTLE_WAGER:
+            return await ctx.respond(f"The minimum battle wager is {fmt(MIN_BATTLE_WAGER)}.", ephemeral=True)
+        if player_one.id == player_two.id:
+            return await ctx.respond("You must choose two different users.", ephemeral=True)
+        if player_one.bot or player_two.bot:
+            return await ctx.respond("You cannot force a battle involving a bot.", ephemeral=True)
+
+        await ctx.defer(ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            await ensure_user(conn, player_one.id)
+            await ensure_user(conn, player_two.id)
+            player_one_row = await get_user(conn, player_one.id)
+            player_two_row = await get_user(conn, player_two.id)
+            player_one_available = await spendable(player_one_row)
+            player_two_available = await spendable(player_two_row)
+
+            if player_one_available < amount:
+                return await ctx.followup.send(
+                    f"{player_one.mention} doesn't have enough {CURRENCY_NAME}. They need {fmt(amount)} but only have {fmt(player_one_available)} available.",
+                    ephemeral=True
+                )
+            if player_two_available < amount:
+                return await ctx.followup.send(
+                    f"{player_two.mention} doesn't have enough {CURRENCY_NAME}. They need {fmt(amount)} but only have {fmt(player_two_available)} available.",
+                    ephemeral=True
+                )
+
+            match_id = gen_id()
+            while await conn.fetchrow("SELECT 1 FROM matches WHERE match_id = $1", match_id):
+                match_id = gen_id()
+
+            await debit_escrow(conn, player_one.id, amount, f"forced battle wager escrowed (match {match_id})", fmt_user(player_one))
+            await debit_escrow(conn, player_two.id, amount, f"forced battle wager escrowed (match {match_id})", fmt_user(player_two))
+            await conn.execute(
+                """
+                INSERT INTO matches (match_id, challenger_id, opponent_id, wager_amount, status, channel_id, created_at, accepted_at)
+                VALUES ($1, $2, $3, $4, 'ACCEPTED', $5, $6, $7)
+                """,
+                match_id, str(player_one.id), str(player_two.id), amount, str(ctx.channel_id), now_utc(), now_utc()
+            )
+
+        embed = discord.Embed(
+            title="⚔️ Forced Battle Created!",
+            description=f"{player_one.mention} vs {player_two.mention}",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Wager", value=fmt(amount), inline=True)
+        embed.add_field(name="Match ID", value=match_id, inline=True)
+        embed.add_field(
+            name="Status",
+            value="Bets are now open! Use `/bet` to wager on a player.\nWhen ready, either player or a moderator can press **Start Match** below or use `/start`.",
+            inline=False
+        )
+        embed.set_footer(text=f"Force-created by mod: {fmt_user(ctx.author)}")
+
+        view = MatchStartView(match_id, player_one.id, player_two.id)
+        await ctx.followup.send(embed=embed, view=view, ephemeral=False)
+        try:
+            msg = await ctx.interaction.original_response()
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
+        except Exception:
+            pass
+
+        await log(
+            f"⚔️ FORCED BATTLE CREATED — Mod: {fmt_user(ctx.author)} | {fmt_user(player_one)} vs {fmt_user(player_two)} | "
+            f"Wager: {fmt(amount)} | Match ID: {match_id}"
+        )
+
+    except Exception:
+        if ctx.response.is_done():
+            await ctx.followup.send("Something went wrong.", ephemeral=True)
+        else:
+            await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /forcebattle | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
 @bot.slash_command(description="Start a battle (locks bets)")
 @option("match_id", str, description="The match ID to start")
 async def start(ctx: discord.ApplicationContext, match_id: str):
@@ -696,8 +858,8 @@ async def start(ctx: discord.ApplicationContext, match_id: str):
             match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
             if not match:
                 return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
-            if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]):
-                return await ctx.respond("You are not a participant in this match.", ephemeral=True)
+            if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]) and not has_mod_role(ctx):
+                return await ctx.respond("You must be one of the players or a moderator to start this match.", ephemeral=True)
             if match["status"] != "ACCEPTED":
                 return await ctx.respond(f"Match `{match_id}` is not in ACCEPTED status (current: {match['status']}).", ephemeral=True)
             await conn.execute(
@@ -947,6 +1109,120 @@ async def cancelbattle(ctx: discord.ApplicationContext, match_id: str):
     except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /cancelbattle | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
+@bot.slash_command(description="[MOD] Accept a pending battle for the users")
+@option("match_id", str, description="The match ID to accept")
+async def forceaccept(ctx: discord.ApplicationContext, match_id: str):
+    try:
+        if not await enforce_channel(ctx):
+            return
+        if not has_mod_role(ctx):
+            return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+
+        match_id = match_id.upper()
+        await ctx.defer(ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
+            if not match:
+                return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
+            if match["status"] != "PENDING":
+                return await ctx.followup.send(
+                    f"Only PENDING matches can be force-accepted (current: {match['status']}).",
+                    ephemeral=True
+                )
+
+            opponent_id = int(match["opponent_id"])
+            await ensure_user(conn, opponent_id)
+            opponent_row = await get_user(conn, opponent_id)
+            opponent_available = await spendable(opponent_row)
+            if opponent_available < match["wager_amount"]:
+                opponent_user = await bot.fetch_user(opponent_id)
+                return await ctx.followup.send(
+                    f"{opponent_user.mention} doesn't have enough {CURRENCY_NAME}. They need {fmt(match['wager_amount'])} but only have {fmt(opponent_available)} available.",
+                    ephemeral=True
+                )
+
+            opponent_user = await bot.fetch_user(opponent_id)
+            challenger_user = await bot.fetch_user(int(match["challenger_id"]))
+            await debit_escrow(conn, opponent_id, match["wager_amount"], f"battle wager escrowed by mod accept (match {match_id})", fmt_user(opponent_user))
+            await conn.execute(
+                "UPDATE matches SET status = 'ACCEPTED', accepted_at = $1 WHERE match_id = $2",
+                now_utc(), match_id
+            )
+
+        embed = await build_accepted_match_embed(
+            match_id,
+            int(match["challenger_id"]),
+            int(match["opponent_id"]),
+            match["wager_amount"],
+            accepted_by_text=f"Force-accepted by mod: {fmt_user(ctx.author)}"
+        )
+        await update_match_message(
+            match_id,
+            embed,
+            view=MatchStartView(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
+        )
+
+        await ctx.followup.send(f"Match `{match_id}` has been force-accepted.", ephemeral=True)
+        await log(
+            f"✅ BATTLE FORCE-ACCEPTED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | "
+            f"{fmt_user(challenger_user)} vs {fmt_user(opponent_user)} | Wager: {fmt(match['wager_amount'])}"
+        )
+
+    except Exception:
+        if ctx.response.is_done():
+            await ctx.followup.send("Something went wrong.", ephemeral=True)
+        else:
+            await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /forceaccept | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
+@bot.slash_command(description="[MOD] Cancel a pending battle for the users")
+@option("match_id", str, description="The match ID to cancel")
+async def forcecancel(ctx: discord.ApplicationContext, match_id: str):
+    try:
+        if not await enforce_channel(ctx):
+            return
+        if not has_mod_role(ctx):
+            return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+
+        match_id = match_id.upper()
+        await ctx.defer(ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
+            if not match:
+                return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
+            if match["status"] != "PENDING":
+                return await ctx.followup.send(
+                    f"Only PENDING matches can be force-cancelled (current: {match['status']}).",
+                    ephemeral=True
+                )
+
+            challenger_id = int(match["challenger_id"])
+            challenger_user = await bot.fetch_user(challenger_id)
+            await conn.execute("UPDATE matches SET status = 'CANCELLED' WHERE match_id = $1", match_id)
+            await release_escrow(conn, challenger_id, match["wager_amount"], f"battle force-cancelled by mod (match {match_id})", fmt_user(challenger_user))
+
+        embed = await build_cancelled_match_embed(
+            f"A moderator cancelled this challenge. {challenger_user.mention}'s wager has been refunded."
+        )
+        await update_match_message(match_id, embed, view=None)
+
+        await ctx.followup.send(f"Match `{match_id}` has been force-cancelled.", ephemeral=True)
+        await log(
+            f"🚫 BATTLE FORCE-CANCELLED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | "
+            f"Challenger refunded: {fmt_user(challenger_user)} | Wager: {fmt(match['wager_amount'])}"
+        )
+
+    except Exception:
+        if ctx.response.is_done():
+            await ctx.followup.send("Something went wrong.", ephemeral=True)
+        else:
+            await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /forcecancel | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
 @bot.slash_command(description="Cancel your bet on a match (before it starts)")
