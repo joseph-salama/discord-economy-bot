@@ -189,6 +189,26 @@ async def build_top_embed(page: int) -> tuple[discord.Embed, int]:
     return embed, total_pages
 
 
+async def update_match_message(match_id: str, embed: discord.Embed, view: discord.ui.View | None = None):
+    async with db_pool.acquire() as conn:
+        match = await conn.fetchrow("SELECT channel_id, message_id FROM matches WHERE match_id = $1", match_id)
+    if not match or not match["message_id"]:
+        return
+
+    channel = bot.get_channel(int(match["channel_id"]))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(match["channel_id"]))
+        except Exception:
+            return
+
+    try:
+        msg = await channel.fetch_message(int(match["message_id"]))
+        await msg.edit(embed=embed, view=view)
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────
@@ -238,6 +258,65 @@ async def on_ready():
 # ─────────────────────────────────────────────
 # PAYOUT LOGIC (shared by /report and /resolve)
 # ─────────────────────────────────────────────
+async def restore_match_to_pre_payout(conn, match_id: str, previous_winner_id: str):
+    """Undo a previously completed payout so the winner can be edited safely."""
+    match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
+    wager = match["wager_amount"]
+    challenger_id = match["challenger_id"]
+    opponent_id = match["opponent_id"]
+    previous_loser_id = challenger_id if previous_winner_id == opponent_id else opponent_id
+
+    previous_winner = await bot.fetch_user(int(previous_winner_id))
+    previous_loser = await bot.fetch_user(int(previous_loser_id))
+
+    # Rebuild the original escrow state for both players.
+    await conn.execute(
+        "UPDATE users SET balance = balance - $1, escrow = escrow + $1 WHERE user_id = $2",
+        wager, str(previous_winner_id)
+    )
+    await log(
+        f"↩️ MATCH PAYOUT REVERSED — {fmt_user(previous_winner)} returned {fmt(wager)} winnings and had {fmt(wager)} re-escrowed "
+        f"(match {match_id})"
+    )
+
+    await conn.execute(
+        "UPDATE users SET balance = balance + $1, escrow = escrow + $1 WHERE user_id = $2",
+        wager, str(previous_loser_id)
+    )
+    await log(
+        f"↩️ MATCH PAYOUT REVERSED — {fmt_user(previous_loser)} had {fmt(wager)} restored and re-escrowed "
+        f"(match {match_id})"
+    )
+
+    # Reset all settled bets back to their original pending escrow state.
+    bets = await conn.fetch("SELECT * FROM bets WHERE match_id = $1", match_id)
+    for bet in bets:
+        bettor = await bot.fetch_user(int(bet["bettor_id"]))
+        if bet["status"] == "WON":
+            await conn.execute(
+                "UPDATE users SET balance = balance - $1, escrow = escrow + $1 WHERE user_id = $2",
+                bet["amount"], bet["bettor_id"]
+            )
+            await log(
+                f"↩️ BET PAYOUT REVERSED — {fmt_user(bettor)} returned {fmt(bet['amount'])} winnings and had "
+                f"{fmt(bet['amount'])} re-escrowed (match {match_id})"
+            )
+        elif bet["status"] == "LOST":
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1, escrow = escrow + $1 WHERE user_id = $2",
+                bet["amount"], bet["bettor_id"]
+            )
+            await log(
+                f"↩️ BET PAYOUT REVERSED — {fmt_user(bettor)} had {fmt(bet['amount'])} restored and re-escrowed "
+                f"(match {match_id})"
+            )
+
+    await conn.execute(
+        "UPDATE bets SET status = 'PENDING' WHERE match_id = $1 AND status IN ('WON', 'LOST')",
+        match_id
+    )
+
+
 async def run_payout(conn, match_id: str, winner_id: str, channel: discord.TextChannel, mod_tag: str = None):
     match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
     wager = match["wager_amount"]
@@ -376,6 +455,106 @@ class ChallengeView(discord.ui.View):
         await log(f"❌ BATTLE DECLINED — Match ID: {self.match_id} | Declined by: {fmt_user(interaction.user)} | Wager refunded: {fmt(match['wager_amount'])}")
 
 
+class MatchStartView(discord.ui.View):
+    def __init__(self, match_id: str, challenger_id: int, opponent_id: int):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+        self.challenger_id = challenger_id
+        self.opponent_id = opponent_id
+
+    @discord.ui.button(label="Start Match", style=discord.ButtonStyle.primary, emoji="▶️")
+    async def start_match(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id not in (self.challenger_id, self.opponent_id):
+            return await interaction.response.send_message("Only one of the two players can start this match.", ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
+            if not match:
+                return await interaction.response.send_message("This match no longer exists.", ephemeral=True)
+            if match["status"] != "ACCEPTED":
+                return await interaction.response.send_message(
+                    f"This match cannot be started right now (current: {match['status']}).",
+                    ephemeral=True
+                )
+
+            await conn.execute(
+                "UPDATE matches SET status = 'ACTIVE', started_at = $1 WHERE match_id = $2",
+                now_utc(), self.match_id
+            )
+
+        challenger = await bot.fetch_user(self.challenger_id)
+        opponent = await bot.fetch_user(self.opponent_id)
+        embed = discord.Embed(
+            title="🥊 Match Started!",
+            description=f"{challenger.mention} vs {opponent.mention}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Match ID", value=self.match_id, inline=True)
+        embed.add_field(name="Status", value="**ACTIVE**", inline=True)
+        embed.add_field(
+            name="Report Winner",
+            value="One of the two players can press the winner button below when the match is over.",
+            inline=False
+        )
+
+        view = MatchReportView(self.match_id, self.challenger_id, self.opponent_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+        await log(f"🥊 MATCH STARTED — Match ID: {self.match_id} | Started by: {fmt_user(interaction.user)}")
+
+
+class MatchReportView(discord.ui.View):
+    def __init__(self, match_id: str, challenger_id: int, opponent_id: int):
+        super().__init__(timeout=None)
+        self.match_id = match_id
+        self.challenger_id = challenger_id
+        self.opponent_id = opponent_id
+
+    async def complete_match(self, interaction: discord.Interaction, winner_id: int):
+        if interaction.user.id not in (self.challenger_id, self.opponent_id):
+            return await interaction.response.send_message("Only one of the two players can report the winner.", ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
+            if not match:
+                return await interaction.response.send_message("This match no longer exists.", ephemeral=True)
+            if match["status"] != "ACTIVE":
+                return await interaction.response.send_message(
+                    f"This match is not active right now (current: {match['status']}).",
+                    ephemeral=True
+                )
+
+            await conn.execute(
+                "UPDATE matches SET status = 'COMPLETED', winner_id = $1, reported_by_id = $2 WHERE match_id = $3",
+                str(winner_id), str(interaction.user.id), self.match_id
+            )
+
+            await interaction.response.defer()
+            await run_payout(conn, self.match_id, str(winner_id), interaction.channel)
+
+        winner_user = await bot.fetch_user(winner_id)
+        challenger = await bot.fetch_user(self.challenger_id)
+        opponent = await bot.fetch_user(self.opponent_id)
+        embed = discord.Embed(
+            title="⚔️ Match Complete!",
+            description=f"{challenger.mention} vs {opponent.mention}",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="Match ID", value=self.match_id, inline=True)
+        embed.add_field(name="Winner", value=winner_user.mention, inline=True)
+        embed.add_field(name="Status", value="**COMPLETED**", inline=True)
+
+        await update_match_message(self.match_id, embed, view=None)
+        await interaction.followup.send(f"Match `{self.match_id}` has been completed!", ephemeral=True)
+
+    @discord.ui.button(label="Challenger Won", style=discord.ButtonStyle.success, emoji="🏆")
+    async def challenger_won(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self.complete_match(interaction, self.challenger_id)
+
+    @discord.ui.button(label="Opponent Won", style=discord.ButtonStyle.success, emoji="🏆")
+    async def opponent_won(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await self.complete_match(interaction, self.opponent_id)
+
+
 class TopLeaderboardView(discord.ui.View):
     def __init__(self, author_id: int, page: int = 1):
         super().__init__(timeout=180)
@@ -471,9 +650,13 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
         embed.set_footer(text=f"Challenge expires in {CHALLENGE_TIMEOUT_SECONDS // 60} minutes")
 
         view = ChallengeView(match_id, ctx.author.id, opponent.id)
-        msg = await ctx.respond(embed=embed, view=view)
-        async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
+        await ctx.respond(embed=embed, view=view)
+        try:
+            msg = await ctx.interaction.original_response()
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
+        except Exception:
+            pass
 
         await log(f"⚔️ BATTLE CREATED — Challenger: {fmt_user(ctx.author)} vs Opponent: {fmt_user(opponent)} | Wager: {fmt(amount)} | Match ID: {match_id}")
 
@@ -505,8 +688,18 @@ async def start(ctx: discord.ApplicationContext, match_id: str):
 
         embed = discord.Embed(
             title="🥊 Match Started!",
-            description=f"Match `{match_id}` is now **ACTIVE**. Bets are locked. Fight!",
+            description=f"Match `{match_id}` is now **ACTIVE**. Bets are locked.",
             color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Report Winner",
+            value="One of the two players can press the winner button on the match message below when the match is over.",
+            inline=False
+        )
+        await update_match_message(
+            match_id,
+            embed,
+            view=MatchReportView(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
         )
         await ctx.respond(embed=embed)
         await log(f"🥊 MATCH STARTED — Match ID: {match_id} | Started by: {fmt_user(ctx.author)}")
@@ -542,6 +735,16 @@ async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord
             )
             await ctx.defer()
             await run_payout(conn, match_id, str(winner.id), ctx.channel)
+
+            complete_embed = discord.Embed(
+                title="⚔️ Match Complete!",
+                description=f"Match `{match_id}` has finished.",
+                color=discord.Color.gold()
+            )
+            complete_embed.add_field(name="Winner", value=winner.mention, inline=True)
+            complete_embed.add_field(name="Status", value="**COMPLETED**", inline=True)
+            await update_match_message(match_id, complete_embed, view=None)
+
             await ctx.send_followup(f"Match `{match_id}` has been completed!", ephemeral=True)
 
     except Exception:
@@ -802,25 +1005,53 @@ async def resolve(ctx: discord.ApplicationContext, match_id: str, winner: discor
             return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
 
         match_id = match_id.upper()
+        await ctx.defer(ephemeral=True)
+
         async with db_pool.acquire() as conn:
             match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
             if not match:
-                return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
             if str(winner.id) not in (match["challenger_id"], match["opponent_id"]):
-                return await ctx.respond("The winner must be one of the two players in this match.", ephemeral=True)
+                return await ctx.followup.send("The winner must be one of the two players in this match.", ephemeral=True)
+            if match["status"] not in ("ACCEPTED", "ACTIVE", "COMPLETED"):
+                return await ctx.followup.send(
+                    f"Match `{match_id}` cannot be force-resolved from `{match['status']}`. "
+                    "Only ACCEPTED, ACTIVE, or COMPLETED matches can be resolved.",
+                    ephemeral=True
+                )
+
+            if match["status"] == "COMPLETED":
+                if match["winner_id"] == str(winner.id):
+                    return await ctx.followup.send(
+                        f"Match `{match_id}` is already completed with {winner.mention} as the winner. No money was changed.",
+                        ephemeral=True
+                    )
+
+                await restore_match_to_pre_payout(conn, match_id, match["winner_id"])
 
             await conn.execute(
                 "UPDATE matches SET status = 'COMPLETED', winner_id = $1, reported_by_id = $2 WHERE match_id = $3",
                 str(winner.id), str(ctx.author.id), match_id
             )
-            await ctx.defer()
             await run_payout(conn, match_id, str(winner.id), ctx.channel, mod_tag=fmt_user(ctx.author))
 
-        await ctx.send_followup(f"Match `{match_id}` has been force-resolved.", ephemeral=True)
+        resolve_embed = discord.Embed(
+            title="⚔️ Match Complete!",
+            description=f"Match `{match_id}` was force-resolved by a moderator.",
+            color=discord.Color.gold()
+        )
+        resolve_embed.add_field(name="Winner", value=winner.mention, inline=True)
+        resolve_embed.add_field(name="Status", value="**COMPLETED**", inline=True)
+        await update_match_message(match_id, resolve_embed, view=None)
+
+        await ctx.followup.send(f"Match `{match_id}` has been force-resolved.", ephemeral=True)
         await log(f"🔧 MATCH FORCE-RESOLVED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | Winner: {fmt_user(winner)}")
 
     except Exception:
-        await ctx.respond("Something went wrong.", ephemeral=True)
+        if ctx.response.is_done():
+            await ctx.followup.send("Something went wrong.", ephemeral=True)
+        else:
+            await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /resolve | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
