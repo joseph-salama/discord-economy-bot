@@ -86,7 +86,7 @@ async def get_user(conn, user_id: int) -> asyncpg.Record:
     return await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", str(user_id))
 
 
-async def spendable(record: asyncpg.Record) -> int:
+def spendable(record: asyncpg.Record) -> int:
     return record["balance"] - record["escrow"]
 
 
@@ -454,7 +454,7 @@ class ChallengeView(discord.ui.View):
             opponent = interaction.user
             await ensure_user(conn, opponent.id)
             opp_row = await get_user(conn, opponent.id)
-            avail = await spendable(opp_row)
+            avail = spendable(opp_row)
             if avail < match["wager_amount"]:
                 return await interaction.response.send_message(
                     f"You don't have enough {CURRENCY_NAME} to accept. You need {fmt(match['wager_amount'])} but only have {fmt(avail)} available.",
@@ -468,16 +468,17 @@ class ChallengeView(discord.ui.View):
             )
 
         challenger = await bot.fetch_user(self.challenger_id)
-        embed = discord.Embed(
-            title="⚔️ Challenge Accepted!",
-            description=f"{challenger.mention} vs {opponent.mention}",
-            color=discord.Color.green()
+        embed = await build_accepted_match_embed(
+            self.match_id,
+            self.challenger_id,
+            self.opponent_id,
+            match["wager_amount"]
         )
-        embed.add_field(name="Wager", value=fmt(match["wager_amount"]), inline=True)
-        embed.add_field(name="Match ID", value=self.match_id, inline=True)
-        embed.add_field(name="Status", value="Bets are now open! Use `/bet` to wager on a player.\nWhen ready, either player can use `/start " + self.match_id + "` to begin.", inline=False)
         self.stop()
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.response.edit_message(
+            embed=embed,
+            view=MatchStartView(self.match_id, self.challenger_id, self.opponent_id)
+        )
         await log(f"✅ BATTLE ACCEPTED — Match ID: {self.match_id} | {fmt_user(challenger)} vs {fmt_user(opponent)} | Wager: {fmt(match['wager_amount'])}")
 
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌")
@@ -683,6 +684,7 @@ async def help(ctx: discord.ApplicationContext):
             "**/report** — Report the winner of your active match.",
             "**/bet** — Bet on a player in an accepted match.",
             "**/balance** — Check your balance or another user's balance.",
+            f"**/give** — Give some of your {CURRENCY_NAME} to another user.",
             f"**/daily** — Claim your daily {fmt(DAILY_AMOUNT)} {CURRENCY_NAME}.",
             "**/top** — View the money leaderboard.",
             "**/cancelbattle** — Cancel a pending battle you created.",
@@ -744,9 +746,10 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
                     ephemeral=True
                 )
 
-            if await spendable(challenger_row) < amount:
-                return await ctx.respond(f"You have insufficient funds. You need {fmt(amount)} but only have {fmt(await spendable(challenger_row))} available.", ephemeral=True)
-            if await spendable(opponent_row) < amount:
+            challenger_available = spendable(challenger_row)
+            if challenger_available < amount:
+                return await ctx.followup.send(f"You have insufficient funds. You need {fmt(amount)} but only have {fmt(challenger_available)} available.", ephemeral=True)
+            if spendable(opponent_row) < amount:
                 return await ctx.respond(f"{opponent.display_name} doesn't have enough {CURRENCY_NAME} to match that wager.", ephemeral=True)
 
             match_id = gen_id()
@@ -770,18 +773,18 @@ async def battle(ctx: discord.ApplicationContext, opponent: discord.Member, amou
         embed.set_footer(text=f"Challenge expires in {CHALLENGE_TIMEOUT_SECONDS // 60} minutes")
 
         view = ChallengeView(match_id, ctx.author.id, opponent.id)
-        await ctx.respond(embed=embed, view=view)
-        try:
-            msg = await ctx.interaction.original_response()
+        msg = await ctx.followup.send(embed=embed, view=view, wait=True)
+        if msg:
             async with db_pool.acquire() as conn:
                 await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
-        except Exception:
-            pass
 
         await log(f"⚔️ BATTLE CREATED — Challenger: {fmt_user(ctx.author)} vs Opponent: {fmt_user(opponent)} | Wager: {fmt(amount)} | Match ID: {match_id}")
 
     except Exception:
-        await ctx.respond("Something went wrong. Please try again.", ephemeral=True)
+        if ctx.response.is_done():
+            await ctx.followup.send("Something went wrong. Please try again.", ephemeral=True)
+        else:
+            await ctx.respond("Something went wrong. Please try again.", ephemeral=True)
         await log(f"❌ ERROR — Command: /battle | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
@@ -818,8 +821,8 @@ async def forcebattle(ctx: discord.ApplicationContext, player_one: discord.Membe
                     ephemeral=True
                 )
 
-            player_one_available = await spendable(player_one_row)
-            player_two_available = await spendable(player_two_row)
+            player_one_available = spendable(player_one_row)
+            player_two_available = spendable(player_two_row)
 
             if player_one_available < amount:
                 return await ctx.followup.send(
@@ -861,13 +864,10 @@ async def forcebattle(ctx: discord.ApplicationContext, player_one: discord.Membe
         embed.set_footer(text=f"Force-created by mod: {fmt_user(ctx.author)}")
 
         view = MatchStartView(match_id, player_one.id, player_two.id)
-        await ctx.followup.send(embed=embed, view=view, ephemeral=False)
-        try:
-            msg = await ctx.interaction.original_response()
+        msg = await ctx.followup.send(embed=embed, view=view, ephemeral=False, wait=True)
+        if msg:
             async with db_pool.acquire() as conn:
                 await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
-        except Exception:
-            pass
 
         await log(
             f"⚔️ FORCED BATTLE CREATED — Mod: {fmt_user(ctx.author)} | {fmt_user(player_one)} vs {fmt_user(player_two)} | "
@@ -962,10 +962,13 @@ async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord
             complete_embed.add_field(name="Status", value="**COMPLETED**", inline=True)
             await update_match_message(match_id, complete_embed, view=None)
 
-            await ctx.send_followup(f"Match `{match_id}` has been completed!", ephemeral=True)
+            await ctx.followup.send(f"Match `{match_id}` has been completed!", ephemeral=True)
 
     except Exception:
-        await ctx.respond("Something went wrong.", ephemeral=True)
+        if ctx.response.is_done():
+            await ctx.followup.send("Something went wrong.", ephemeral=True)
+        else:
+            await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /report | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
@@ -1001,8 +1004,9 @@ async def bet(ctx: discord.ApplicationContext, match_id: str, player: discord.Me
                 return await ctx.respond("You already have an active bet on this match. Use `/cancelbet` to change it.", ephemeral=True)
 
             bettor_row = await get_user(conn, ctx.author.id)
-            if await spendable(bettor_row) < amount:
-                return await ctx.respond(f"Insufficient funds. You have {fmt(await spendable(bettor_row))} available.", ephemeral=True)
+            bettor_available = spendable(bettor_row)
+            if bettor_available < amount:
+                return await ctx.respond(f"Insufficient funds. You have {fmt(bettor_available)} available.", ephemeral=True)
 
             bet_id = gen_id(5)
             while await conn.fetchrow("SELECT 1 FROM bets WHERE bet_id = $1", bet_id):
@@ -1025,6 +1029,64 @@ async def bet(ctx: discord.ApplicationContext, match_id: str, player: discord.Me
     except Exception:
         await ctx.respond("Something went wrong.", ephemeral=True)
         await log(f"❌ ERROR — Command: /bet | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
+@bot.slash_command(description=f"Give some of your {CURRENCY_NAME} to another user")
+@option("user", discord.Member, description="User to give money to")
+@option("amount", int, description=f"Amount of {CURRENCY_NAME} to give")
+async def give(ctx: discord.ApplicationContext, user: discord.Member, amount: int):
+    try:
+        if not await enforce_channel(ctx):
+            return
+        if amount <= 0:
+            return await ctx.respond(f"You must give more than {fmt(0)}.", ephemeral=True)
+        if user.id == ctx.author.id:
+            return await ctx.respond("You cannot give money to yourself.", ephemeral=True)
+        if user.bot:
+            return await ctx.respond("You cannot give money to a bot.", ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            await ensure_user(conn, ctx.author.id)
+            await ensure_user(conn, user.id)
+
+            sender_row = await get_user(conn, ctx.author.id)
+            sender_available = spendable(sender_row)
+            if sender_available < amount:
+                return await ctx.respond(
+                    f"You only have {fmt(sender_available)} available, so you can't give {fmt(amount)}.",
+                    ephemeral=True
+                )
+
+            await conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE user_id = $2",
+                amount, str(ctx.author.id)
+            )
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                amount, str(user.id)
+            )
+
+            sender_updated = await get_user(conn, ctx.author.id)
+            recipient_updated = await get_user(conn, user.id)
+
+        embed = discord.Embed(
+            title="💸 Transfer Complete",
+            description=f"{ctx.author.mention} gave {fmt(amount)} to {user.mention}.",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name=f"{ctx.author.display_name}'s New Available", value=fmt(sender_updated["balance"] - sender_updated["escrow"]), inline=True)
+        embed.add_field(name=f"{user.display_name}'s New Available", value=fmt(recipient_updated["balance"] - recipient_updated["escrow"]), inline=True)
+        await ctx.respond(embed=embed)
+
+        await log(
+            f"💸 TRANSFER — {fmt_user(ctx.author)} gave {fmt(amount)} to {fmt_user(user)} | "
+            f"Sender available now: {fmt(sender_updated['balance'] - sender_updated['escrow'])} | "
+            f"Recipient available now: {fmt(recipient_updated['balance'] - recipient_updated['escrow'])}"
+        )
+
+    except Exception:
+        await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /give | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
 @bot.slash_command(description="Check your balance or another user's balance")
@@ -1172,7 +1234,7 @@ async def forceaccept(ctx: discord.ApplicationContext, match_id: str):
             opponent_id = int(match["opponent_id"])
             await ensure_user(conn, opponent_id)
             opponent_row = await get_user(conn, opponent_id)
-            opponent_available = await spendable(opponent_row)
+            opponent_available = spendable(opponent_row)
             if opponent_available < match["wager_amount"]:
                 opponent_user = await bot.fetch_user(opponent_id)
                 return await ctx.followup.send(
