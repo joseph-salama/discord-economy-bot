@@ -963,6 +963,42 @@ async def cancelbet(ctx: discord.ApplicationContext, match_id: str):
         await log(f"❌ ERROR — Command: /cancelbet | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
 
+@bot.slash_command(description="[MOD] Reset a user's balance, available balance, and escrow to 0")
+@option("user", discord.Member, description="User to reset")
+async def reset(ctx: discord.ApplicationContext, user: discord.Member):
+    try:
+        if not await enforce_channel(ctx):
+            return
+        if not has_mod_role(ctx):
+            return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+
+        async with db_pool.acquire() as conn:
+            await ensure_user(conn, user.id)
+            row = await get_user(conn, user.id)
+            old_balance = row["balance"]
+            old_escrow = row["escrow"]
+            old_available = old_balance - old_escrow
+
+            await conn.execute(
+                "UPDATE users SET balance = 0, escrow = 0 WHERE user_id = $1",
+                str(user.id)
+            )
+
+        await ctx.respond(
+            f"Reset {user.mention}'s balance. Previous totals — Available: {fmt(old_available)} | In Escrow: {fmt(old_escrow)} | Total: {fmt(old_balance)}. New totals are all {fmt(0)}.",
+            ephemeral=True
+        )
+        await log(
+            f"🧹 BALANCE RESET — Mod: {fmt_user(ctx.author)} | User: {fmt_user(user)} | "
+            f"Old available: {fmt(old_available)} | Old escrow: {fmt(old_escrow)} | Old total: {fmt(old_balance)} | "
+            f"New available: {fmt(0)} | New escrow: {fmt(0)} | New total: {fmt(0)}"
+        )
+
+    except Exception:
+        await ctx.respond("Something went wrong.", ephemeral=True)
+        await log(f"❌ ERROR — Command: /reset | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+
 @bot.slash_command(description="[MOD] Adjust a user's balance")
 @option("user", discord.Member, description="User to adjust")
 @option("amount", int, description="Amount to add (positive) or remove (negative)")
