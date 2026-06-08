@@ -1,10 +1,9 @@
 import os
-
 import asyncpg
 import discord
-
+from discord.ext import tasks
 from bot_commands import register_commands
-from bot_helpers import init_database, log, reward_queue_match, set_bot, set_db_pool
+from bot_helpers import init_database, log, reward_queue_match, set_bot, set_db_pool, get_db_pool
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -12,25 +11,39 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
+
 bot = discord.Bot(intents=intents)
 
 set_bot(bot)
 register_commands(bot)
 
+@tasks.loop(minutes=4)
+async def keepalive():
+    try:
+        async with get_db_pool().acquire() as conn:
+            await conn.fetchval("SELECT 1")
+    except Exception as e:
+        print(f"⚠️ Keepalive ping failed: {e}")
 
 @bot.event
 async def on_ready():
     try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            max_inactive_connection_lifetime=300
+        )
         set_db_pool(db_pool)
         async with db_pool.acquire() as conn:
             await init_database(conn)
         print(f"✅ Logged in as {bot.user} | DB connected")
         await log(f"🤖 Bot started and ready — {bot.user}")
+        if not keepalive.is_running():
+            keepalive.start()
     except Exception as e:
         import traceback
         print(f"❌ FATAL on_ready error: {traceback.format_exc()}")
-
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -38,13 +51,14 @@ async def on_message(message: discord.Message):
         reward_queue_match
     except Exception:
         return
+
     from bot_helpers import get_db_pool
     try:
         get_db_pool()
     except RuntimeError:
         return
-    await reward_queue_match(message)
 
+    await reward_queue_match(message)
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
@@ -53,7 +67,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         get_db_pool()
     except RuntimeError:
         return
-    await reward_queue_match(after)
 
+    await reward_queue_match(after)
 
 bot.run(DISCORD_TOKEN)
