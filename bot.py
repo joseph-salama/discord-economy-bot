@@ -20,12 +20,16 @@ register_commands(bot)
 
 @bot.event
 async def on_ready():
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
-    set_db_pool(db_pool)
-    async with db_pool.acquire() as conn:
-        await init_database(conn)
-    print(f"✅ Logged in as {bot.user} | DB connected")
-    await log(f"🤖 Bot started and ready — {bot.user}")
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        set_db_pool(db_pool)
+        async with db_pool.acquire() as conn:
+            await init_database(conn)
+        print(f"✅ Logged in as {bot.user} | DB connected")
+        await log(f"🤖 Bot started and ready — {bot.user}")
+    except Exception as e:
+        import traceback
+        print(f"❌ FATAL on_ready error: {traceback.format_exc()}")
 
 
 @bot.event
