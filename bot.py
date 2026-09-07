@@ -5,7 +5,7 @@ from discord.ext import tasks
 from bot_commands import register_commands
 from bot_helpers import init_database, log, reward_queue_match, set_bot, set_db_pool, get_db_pool
 from bot_views import expire_stale_challenges, restore_persistent_views
-from bot_team_matches import restore_team_match_views
+from bot_team_matches import expire_stale_team_matches, restore_team_match_views
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -40,6 +40,10 @@ async def challenge_expiry_sweeper():
         await expire_stale_challenges()
     except Exception as e:
         print(f"⚠️ Challenge expiry sweeper failed: {e}")
+    try:
+        await expire_stale_team_matches()
+    except Exception as e:
+        print(f"⚠️ Team match expiry sweeper failed: {e}")
 
 @bot.event
 async def on_ready():

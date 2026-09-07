@@ -81,6 +81,8 @@ def register_commands(bot: discord.Bot):
                     "**/forcecancel** — [MOD] Cancel a pending battle for the users.",
                     "**/cancelactives** — [MOD] Cancel all open player and team matches and refund wagers/bets.",
                     "**/match** — [MOD] Create a team (role) match people can bet on.",
+                    "**/cancelteam** — [MOD] Cancel an OPEN/ACTIVE team match and refund bets.",
+                    "**/resolveteam** — [MOD] Force-resolve a team match (can reverse a wrong winner).",
                 ])
 
             embed = discord.Embed(
@@ -287,7 +289,7 @@ def register_commands(bot: discord.Bot):
                 value="One of the two players can press the winner button on the match message below when the match is over.",
                 inline=False,
             )
-            report_view = MatchReportView(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
+            report_view = await MatchReportView.create(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
             get_bot().add_view(report_view)
             await update_match_message(match_id, embed, view=report_view)
             await ctx.respond(embed=embed)

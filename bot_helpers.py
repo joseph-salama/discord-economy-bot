@@ -32,6 +32,7 @@ STARTING_BALANCE = 250
 MIN_BATTLE_WAGER = 100
 MIN_TEAM_BET = 1
 CHALLENGE_TIMEOUT_SECONDS = 300
+TEAM_MATCH_OPEN_TIMEOUT_SECONDS = 7200  # 2 hours — OPEN team matches auto-cancel + refund
 MODERATOR_ROLE_ID = _env_int("MODERATOR_ROLE_ID", 1494455406691483658)
 LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID", 1494449437240463451)
 QUEUE_CHANNEL_IDS = _env_int_set(
@@ -532,6 +533,44 @@ async def find_open_match_between(conn, user_one_id: int, user_two_id: int) -> a
         str(user_one_id),
         str(user_two_id),
     )
+
+
+async def find_open_team_match_between(conn, role_one_id: int, role_two_id: int) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        SELECT *
+        FROM team_matches
+        WHERE (
+            (role_one_id = $1 AND role_two_id = $2)
+            OR
+            (role_one_id = $2 AND role_two_id = $1)
+        )
+        AND status IN ('OPEN', 'ACTIVE')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        str(role_one_id),
+        str(role_two_id),
+    )
+
+
+def resolve_role_label(role_id: int, fallback: str = "Team") -> str:
+    try:
+        for guild in get_bot().guilds:
+            role = guild.get_role(int(role_id))
+            if role:
+                return role.name
+    except Exception:
+        pass
+    return fallback
+
+
+async def resolve_user_label(user_id: int, fallback: str = "Player") -> str:
+    try:
+        user = get_bot().get_user(int(user_id)) or await get_bot().fetch_user(int(user_id))
+        return user.name
+    except Exception:
+        return fallback
 
 
 async def init_database(conn):
@@ -1146,3 +1185,67 @@ async def cancel_team_match_with_refunds(conn, match_id: str) -> int:
         if released > 0:
             refunded += 1
     return refunded
+
+
+async def restore_team_match_to_pre_payout(conn, match_id: str, previous_winner_role_id: str):
+    """Reverse a completed team match payout so it can be re-resolved."""
+    match = await lock_team_match(conn, match_id)
+    if not match:
+        raise PayoutReverseError(f"Team match `{match_id}` not found.")
+    if match["status"] != "COMPLETED":
+        raise PayoutReverseError(
+            f"Team match `{match_id}` must be COMPLETED to reverse a payout (current: {match['status']})."
+        )
+
+    bets = await conn.fetch("SELECT * FROM team_bets WHERE match_id = $1", match_id)
+    for bet in bets:
+        if bet["status"] != "WON":
+            continue
+        bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
+        bettor_row = await lock_user(conn, int(bet["bettor_id"]))
+        if not bettor_row or bettor_row["balance"] < bet["amount"]:
+            have = bettor_row["balance"] if bettor_row else 0
+            raise PayoutReverseError(
+                f"Cannot reverse team match `{match_id}`: {fmt_user(bettor)} only has {fmt(have)} "
+                f"but needs {fmt(bet['amount'])} still available to return bet winnings."
+            )
+
+    for bet in bets:
+        bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
+        if bet["status"] == "WON":
+            updated = await conn.fetchrow(
+                """
+                UPDATE users
+                SET balance = balance - $1, escrow = escrow + $1
+                WHERE user_id = $2 AND balance >= $1
+                RETURNING user_id
+                """,
+                bet["amount"],
+                bet["bettor_id"],
+            )
+            if not updated:
+                raise PayoutReverseError(
+                    f"Cannot reverse team match `{match_id}`: failed to reclaim bet winnings from {fmt_user(bettor)}."
+                )
+            await log(
+                f"↩️ TEAM BET PAYOUT REVERSED — {fmt_user(bettor)} returned {fmt(bet['amount'])} winnings "
+                f"and had {fmt(bet['amount'])} re-escrowed (match {match_id})"
+            )
+        elif bet["status"] == "LOST":
+            await conn.execute(
+                "UPDATE users SET balance = balance + $1, escrow = escrow + $1 WHERE user_id = $2",
+                bet["amount"],
+                bet["bettor_id"],
+            )
+            await log(
+                f"↩️ TEAM BET PAYOUT REVERSED — {fmt_user(bettor)} had {fmt(bet['amount'])} restored "
+                f"and re-escrowed (match {match_id})"
+            )
+
+    await conn.execute(
+        "UPDATE team_bets SET status = 'PENDING' WHERE match_id = $1 AND status IN ('WON', 'LOST')",
+        match_id,
+    )
+    await log(
+        f"↩️ TEAM MATCH PAYOUT REVERSED — Match ID: {match_id} | Previous winner role: {previous_winner_role_id}"
+    )

@@ -25,6 +25,7 @@ from bot_helpers import (
     now_utc,
     release_escrow,
     release_escrow_up_to,
+    resolve_user_label,
     run_payout,
     spendable,
     update_match_message,
@@ -176,7 +177,7 @@ async def restore_persistent_views():
 
     for match in active:
         bot.add_view(
-            MatchReportView(
+            await MatchReportView.create(
                 match["match_id"],
                 int(match["challenger_id"]),
                 int(match["opponent_id"]),
@@ -409,7 +410,7 @@ class MatchStartView(discord.ui.View):
             inline=False,
         )
 
-        view = MatchReportView(self.match_id, self.challenger_id, self.opponent_id)
+        view = await MatchReportView.create(self.match_id, self.challenger_id, self.opponent_id)
         get_bot().add_view(view)
         await _edit_or_fallback(
             interaction,
@@ -422,19 +423,24 @@ class MatchStartView(discord.ui.View):
 
 
 class MatchReportView(discord.ui.View):
-    def __init__(self, match_id: str, challenger_id: int, opponent_id: int):
+    def __init__(
+        self,
+        match_id: str,
+        challenger_id: int,
+        opponent_id: int,
+        challenger_label: str | None = None,
+        opponent_label: str | None = None,
+    ):
         super().__init__(timeout=None)
         self.match_id = match_id
         self.challenger_id = challenger_id
         self.opponent_id = opponent_id
 
-        challenger_user = get_bot().get_user(challenger_id)
-        opponent_user = get_bot().get_user(opponent_id)
-        challenger_label = challenger_user.name if challenger_user else "Challenger"
-        opponent_label = opponent_user.name if opponent_user else "Opponent"
+        challenger_name = challenger_label or "Challenger"
+        opponent_name = opponent_label or "Opponent"
 
         challenger_button = discord.ui.Button(
-            label=f"{challenger_label} Won",
+            label=f"{challenger_name} Won"[:80],
             style=discord.ButtonStyle.success,
             emoji="🏆",
             custom_id=f"match_report:{match_id}:challenger",
@@ -443,13 +449,19 @@ class MatchReportView(discord.ui.View):
         self.add_item(challenger_button)
 
         opponent_button = discord.ui.Button(
-            label=f"{opponent_label} Won",
+            label=f"{opponent_name} Won"[:80],
             style=discord.ButtonStyle.success,
             emoji="🏆",
             custom_id=f"match_report:{match_id}:opponent",
         )
         opponent_button.callback = self.opponent_won
         self.add_item(opponent_button)
+
+    @classmethod
+    async def create(cls, match_id: str, challenger_id: int, opponent_id: int):
+        challenger_label = await resolve_user_label(challenger_id, "Challenger")
+        opponent_label = await resolve_user_label(opponent_id, "Opponent")
+        return cls(match_id, challenger_id, opponent_id, challenger_label, opponent_label)
 
     async def complete_match(self, interaction: discord.Interaction, winner_id: int):
         if interaction.user.id not in (self.challenger_id, self.opponent_id):

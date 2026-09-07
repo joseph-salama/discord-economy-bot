@@ -20,13 +20,16 @@ from bot_helpers import (
     enforce_channel,
     ensure_user,
     find_open_match_between,
+    find_open_team_match_between,
     fmt,
     fmt_user,
     gen_id,
     get_bot,
     get_db_pool,
+    get_role_mention,
     has_mod_role,
     lock_match,
+    lock_team_match,
     lock_user,
     lock_users_ordered,
     log,
@@ -34,13 +37,19 @@ from bot_helpers import (
     release_escrow,
     release_escrow_up_to,
     restore_match_to_pre_payout,
+    restore_team_match_to_pre_payout,
     run_payout,
+    run_team_match_payout,
     spendable,
     update_match_message,
     update_team_match_message,
 )
 from bot_views import MatchStartView, cancel_challenge_expiry_task
-from bot_team_matches import TeamMatchOpenView
+from bot_team_matches import (
+    TeamMatchOpenView,
+    cancel_team_match_expiry_task,
+    schedule_team_match_expiry,
+)
 
 
 def register_admin_commands(bot: discord.Bot):
@@ -628,6 +637,7 @@ def register_admin_commands(bot: discord.Bot):
                 await update_match_message(match["match_id"], embed, view=None)
 
             for team_match in cancelled_team_matches:
+                cancel_team_match_expiry_task(team_match["match_id"])
                 cleared_embed = discord.Embed(
                     title="🏟️ Team Match — Cancelled",
                     description="A moderator cleared all open matches. Pending bets were refunded.",
@@ -684,6 +694,13 @@ def register_admin_commands(bot: discord.Bot):
             match_created = False
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
+                    existing = await find_open_team_match_between(conn, team_one.id, team_two.id)
+                    if existing:
+                        return await ctx.followup.send(
+                            f"There is already an **{existing['status']}** team match between those roles "
+                            f"(`{existing['match_id']}`). Cancel or complete it first.",
+                            ephemeral=True,
+                        )
                     while await conn.fetchrow("SELECT 1 FROM team_matches WHERE match_id = $1", match_id):
                         match_id = gen_id()
                     await conn.execute(
@@ -702,7 +719,13 @@ def register_admin_commands(bot: discord.Bot):
                     )
                     match_created = True
 
-            view = TeamMatchOpenView(match_id, team_one.id, team_two.id)
+            view = TeamMatchOpenView(
+                match_id,
+                team_one.id,
+                team_two.id,
+                team_one.name,
+                team_two.name,
+            )
             get_bot().add_view(view)
             embed = await build_team_match_embed(
                 match_id,
@@ -711,12 +734,6 @@ def register_admin_commands(bot: discord.Bot):
                 "OPEN",
                 created_by_text=f"Created by {fmt_user(ctx.author)} | Match `{match_id}`",
             )
-            # Show role names on buttons when possible
-            for child in view.children:
-                if isinstance(child, discord.ui.Button) and child.custom_id == f"team_bet:{match_id}:{team_one.id}":
-                    child.label = f"Bet on {team_one.name}"[:80]
-                elif isinstance(child, discord.ui.Button) and child.custom_id == f"team_bet:{match_id}:{team_two.id}":
-                    child.label = f"Bet on {team_two.name}"[:80]
 
             try:
                 msg = await ctx.followup.send(embed=embed, view=view, wait=True)
@@ -742,6 +759,7 @@ def register_admin_commands(bot: discord.Bot):
                     async with get_db_pool().acquire() as conn:
                         async with conn.transaction():
                             await cancel_team_match_with_refunds(conn, match_id)
+                    cancel_team_match_expiry_task(match_id)
                     await ctx.followup.send(
                         "Could not post the team match message, so the match was cancelled.",
                         ephemeral=True,
@@ -749,6 +767,7 @@ def register_admin_commands(bot: discord.Bot):
                     return
                 raise
 
+            schedule_team_match_expiry(match_id)
             await log(
                 f"🏟️ TEAM MATCH CREATED — Mod: {fmt_user(ctx.author)} | {team_one.name} vs {team_two.name} | Match ID: {match_id}"
             )
@@ -759,3 +778,179 @@ def register_admin_commands(bot: discord.Bot):
             else:
                 await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /match | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+    @bot.slash_command(description="[MOD] Cancel an OPEN or ACTIVE team match and refund bets")
+    @option("match_id", str, description="The team match ID")
+    async def cancelteam(ctx: discord.ApplicationContext, match_id: str):
+        try:
+            if not await enforce_channel(ctx):
+                return
+            if not has_mod_role(ctx):
+                return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+
+            match_id = match_id.upper()
+            await ctx.defer(ephemeral=True)
+
+            role_one_id = None
+            role_two_id = None
+            refunded = 0
+            try:
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        match = await lock_team_match(conn, match_id)
+                        if not match:
+                            return await ctx.followup.send(f"Team match `{match_id}` not found.", ephemeral=True)
+                        if match["status"] not in ("OPEN", "ACTIVE"):
+                            return await ctx.followup.send(
+                                f"Only OPEN or ACTIVE team matches can be cancelled (current: {match['status']}).",
+                                ephemeral=True,
+                            )
+                        role_one_id = int(match["role_one_id"])
+                        role_two_id = int(match["role_two_id"])
+                        refunded = await cancel_team_match_with_refunds(conn, match_id)
+            except InsufficientFundsError as e:
+                await log(f"❌ ERROR — /cancelteam refund failed for {match_id}: {e}")
+                return await ctx.followup.send(
+                    "Could not cancel cleanly because escrow was inconsistent. No money was changed.",
+                    ephemeral=True,
+                )
+
+            cancel_team_match_expiry_task(match_id)
+            embed = await build_team_match_embed(
+                match_id,
+                role_one_id,
+                role_two_id,
+                "CANCELLED",
+                created_by_text=f"Cancelled by {fmt_user(ctx.author)} via /cancelteam",
+            )
+            await update_team_match_message(match_id, embed, view=None)
+            await ctx.followup.send(
+                f"Team match `{match_id}` cancelled. Refunded **{refunded}** bet(s).",
+                ephemeral=True,
+            )
+            await log(
+                f"🚫 TEAM MATCH FORCE-CANCELLED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | Bets refunded: {refunded}"
+            )
+
+        except Exception:
+            if ctx.response.is_done():
+                await ctx.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await ctx.respond("Something went wrong.", ephemeral=True)
+            await log(f"❌ ERROR — Command: /cancelteam | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+    @bot.slash_command(description="[MOD] Force-resolve a team match (can reverse a wrong winner)")
+    @option("match_id", str, description="The team match ID")
+    @option("winner", discord.Role, description="The winning team role")
+    async def resolveteam(ctx: discord.ApplicationContext, match_id: str, winner: discord.Role):
+        try:
+            if not await enforce_channel(ctx):
+                return
+            if not has_mod_role(ctx):
+                return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+
+            match_id = match_id.upper()
+            await ctx.defer(ephemeral=True)
+
+            role_one_id = None
+            role_two_id = None
+            try:
+                payout_embed = None
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        match = await lock_team_match(conn, match_id)
+                        if not match:
+                            return await ctx.followup.send(f"Team match `{match_id}` not found.", ephemeral=True)
+                        if str(winner.id) not in (match["role_one_id"], match["role_two_id"]):
+                            return await ctx.followup.send(
+                                "The winner must be one of the two team roles in this match.",
+                                ephemeral=True,
+                            )
+                        if match["status"] not in ("ACTIVE", "COMPLETED"):
+                            return await ctx.followup.send(
+                                f"Team match `{match_id}` cannot be force-resolved from `{match['status']}`. "
+                                "Only ACTIVE or COMPLETED team matches can be resolved.",
+                                ephemeral=True,
+                            )
+
+                        role_one_id = int(match["role_one_id"])
+                        role_two_id = int(match["role_two_id"])
+
+                        if match["status"] == "COMPLETED":
+                            if match["winner_role_id"] == str(winner.id):
+                                return await ctx.followup.send(
+                                    f"Team match `{match_id}` is already completed with {winner.mention} as the winner. "
+                                    "No money was changed.",
+                                    ephemeral=True,
+                                )
+                            await restore_team_match_to_pre_payout(conn, match_id, match["winner_role_id"])
+                            await conn.execute(
+                                """
+                                UPDATE team_matches
+                                SET status = 'COMPLETED', winner_role_id = $1
+                                WHERE match_id = $2
+                                """,
+                                str(winner.id),
+                                match_id,
+                            )
+                        else:
+                            completed = await conn.fetchrow(
+                                """
+                                UPDATE team_matches
+                                SET status = 'COMPLETED', winner_role_id = $1
+                                WHERE match_id = $2 AND status = 'ACTIVE'
+                                RETURNING *
+                                """,
+                                str(winner.id),
+                                match_id,
+                            )
+                            if not completed:
+                                return await ctx.followup.send(
+                                    f"Team match `{match_id}` could not be force-resolved (it may have just changed status).",
+                                    ephemeral=True,
+                                )
+
+                        payout_embed = await run_team_match_payout(
+                            conn,
+                            match_id,
+                            str(winner.id),
+                            mod_tag=fmt_user(ctx.author),
+                        )
+            except PayoutReverseError as e:
+                return await ctx.followup.send(str(e), ephemeral=True)
+            except InsufficientFundsError as e:
+                await log(f"❌ ERROR — /resolveteam payout failed for {match_id}: {e}")
+                return await ctx.followup.send(
+                    "Force-resolve failed because escrowed funds were inconsistent. No money was changed.",
+                    ephemeral=True,
+                )
+
+            cancel_team_match_expiry_task(match_id)
+            if payout_embed:
+                await ctx.channel.send(embed=payout_embed)
+
+            resolve_embed = await build_team_match_embed(
+                match_id,
+                role_one_id,
+                role_two_id,
+                "COMPLETED",
+                winner_role_id=winner.id,
+                created_by_text=f"Force-resolved by {fmt_user(ctx.author)} via /resolveteam",
+            )
+            await update_team_match_message(match_id, resolve_embed, view=None)
+
+            await ctx.followup.send(
+                f"Team match `{match_id}` has been force-resolved. Winner: {await get_role_mention(winner.id)}",
+                ephemeral=True,
+            )
+            await log(
+                f"🔧 TEAM MATCH FORCE-RESOLVED — Match ID: {match_id} | Mod: {fmt_user(ctx.author)} | "
+                f"Winner role: {winner.id}"
+            )
+
+        except Exception:
+            if ctx.response.is_done():
+                await ctx.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await ctx.respond("Something went wrong.", ephemeral=True)
+            await log(f"❌ ERROR — Command: /resolveteam | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
