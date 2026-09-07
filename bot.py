@@ -24,6 +24,8 @@ bot = discord.Bot(intents=intents)
 set_bot(bot)
 register_commands(bot)
 
+_db_ready = False
+
 @tasks.loop(minutes=4)
 async def keepalive():
     try:
@@ -41,20 +43,29 @@ async def challenge_expiry_sweeper():
 
 @bot.event
 async def on_ready():
+    global _db_ready
     try:
-        db_pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=10,
-            max_inactive_connection_lifetime=300
-        )
-        set_db_pool(db_pool)
-        async with db_pool.acquire() as conn:
-            await init_database(conn)
+        if not _db_ready:
+            db_pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                max_inactive_connection_lifetime=300
+            )
+            set_db_pool(db_pool)
+            async with db_pool.acquire() as conn:
+                await init_database(conn)
+            _db_ready = True
+            print(f"✅ Logged in as {bot.user} | DB connected")
+            await log(f"🤖 Bot started and ready — {bot.user}")
+        else:
+            # Reconnect: reuse existing pool, verify it, refresh views
+            async with get_db_pool().acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            print(f"✅ Reconnected as {bot.user} | DB pool reused")
+
         await restore_persistent_views()
         await restore_team_match_views()
-        print(f"✅ Logged in as {bot.user} | DB connected")
-        await log(f"🤖 Bot started and ready — {bot.user}")
         if not keepalive.is_running():
             keepalive.start()
         if not challenge_expiry_sweeper.is_running():

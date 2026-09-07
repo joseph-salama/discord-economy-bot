@@ -1,3 +1,4 @@
+import asyncpg
 import discord
 
 from bot_helpers import (
@@ -118,6 +119,11 @@ class TeamBetModal(discord.ui.Modal):
                         str(self.role_id),
                         amount,
                     )
+        except asyncpg.UniqueViolationError:
+            return await interaction.response.send_message(
+                "You already have a bet on this match. Use **Cancel My Bet** first to change it.",
+                ephemeral=True,
+            )
         except InsufficientFundsError:
             return await interaction.response.send_message(
                 f"Insufficient funds to bet {fmt(amount)}.",
@@ -325,7 +331,24 @@ class TeamMatchOpenView(discord.ui.View):
             "ACTIVE",
             created_by_text=f"Started by {fmt_user(interaction.user)} | Match `{self.match_id}`",
         )
-        await interaction.response.edit_message(embed=embed, view=active_view)
+        try:
+            await interaction.response.edit_message(embed=embed, view=active_view)
+        except Exception as e:
+            await log(f"⚠️ TEAM UI EDIT FALLBACK — Match ID: {self.match_id} | Error: {e}")
+            await update_team_match_message(self.match_id, embed, view=active_view)
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"Team match `{self.match_id}` started. Bets are locked.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"Team match `{self.match_id}` started. Bets are locked.",
+                        ephemeral=True,
+                    )
+            except Exception:
+                pass
         await log(f"🥊 TEAM MATCH STARTED — Match ID: {self.match_id} | By: {fmt_user(interaction.user)}")
 
     async def cancel_match(self, interaction: discord.Interaction):

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import random
 import re
@@ -255,6 +256,15 @@ async def lock_user(conn, user_id: int) -> asyncpg.Record | None:
     )
 
 
+async def lock_users_ordered(conn, *user_ids: int) -> dict[int, asyncpg.Record | None]:
+    """Lock users in ascending ID order to avoid deadlocks."""
+    ordered = sorted({int(uid) for uid in user_ids})
+    locked: dict[int, asyncpg.Record | None] = {}
+    for uid in ordered:
+        locked[uid] = await lock_user(conn, uid)
+    return locked
+
+
 async def complete_match_if_active(
     conn,
     match_id: str,
@@ -365,11 +375,18 @@ async def update_match_message(match_id: str, embed: discord.Embed, view: discor
         except Exception:
             return
 
-    try:
-        msg = await channel.fetch_message(int(match["message_id"]))
-        await msg.edit(embed=embed, view=view)
-    except Exception:
-        pass
+    last_error = None
+    for attempt in range(3):
+        try:
+            msg = await channel.fetch_message(int(match["message_id"]))
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception as e:
+            last_error = e
+            await asyncio.sleep(0.35 * (attempt + 1))
+    await log(
+        f"⚠️ MATCH MESSAGE UPDATE FAILED — Match ID: {match_id} | Error: {last_error}"
+    )
 
 
 async def build_accepted_match_embed(
@@ -592,6 +609,20 @@ async def init_database(conn):
             amount INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'PENDING'
         )
+        """
+    )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS bets_one_pending_per_user
+        ON bets (match_id, bettor_id)
+        WHERE status = 'PENDING'
+        """
+    )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS team_bets_one_pending_per_user
+        ON team_bets (match_id, bettor_id)
+        WHERE status = 'PENDING'
         """
     )
 
@@ -999,11 +1030,18 @@ async def update_team_match_message(match_id: str, embed: discord.Embed, view: d
         except Exception:
             return
 
-    try:
-        msg = await channel.fetch_message(int(match["message_id"]))
-        await msg.edit(embed=embed, view=view)
-    except Exception:
-        pass
+    last_error = None
+    for attempt in range(3):
+        try:
+            msg = await channel.fetch_message(int(match["message_id"]))
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception as e:
+            last_error = e
+            await asyncio.sleep(0.35 * (attempt + 1))
+    await log(
+        f"⚠️ TEAM MATCH MESSAGE UPDATE FAILED — Match ID: {match_id} | Error: {last_error}"
+    )
 
 
 async def run_team_match_payout(conn, match_id: str, winner_role_id: str, mod_tag: str | None = None) -> discord.Embed:

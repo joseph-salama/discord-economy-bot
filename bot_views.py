@@ -24,6 +24,7 @@ from bot_helpers import (
     log,
     now_utc,
     release_escrow,
+    release_escrow_up_to,
     run_payout,
     spendable,
     update_match_message,
@@ -31,6 +32,29 @@ from bot_helpers import (
 
 # match_id -> expiry task, so we can cancel if accepted/declined early
 _challenge_expiry_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _edit_or_fallback(
+    interaction: discord.Interaction,
+    match_id: str,
+    embed: discord.Embed,
+    view: discord.ui.View | None,
+    fallback_note: str,
+):
+    """Edit the interaction message, or fall back to DB-linked message update."""
+    try:
+        await interaction.response.edit_message(embed=embed, view=view)
+        return
+    except Exception as e:
+        await log(f"⚠️ UI EDIT FALLBACK — Match ID: {match_id} | Error: {e}")
+        await update_match_message(match_id, embed, view=view)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(fallback_note, ephemeral=True)
+            else:
+                await interaction.response.send_message(fallback_note, ephemeral=True)
+        except Exception:
+            pass
 
 
 def cancel_challenge_expiry_task(match_id: str):
@@ -49,7 +73,7 @@ async def expire_pending_challenge(match_id: str) -> bool:
                 if not match:
                     return False
                 challenger = await get_bot().fetch_user(int(match["challenger_id"]))
-                await release_escrow(
+                await release_escrow_up_to(
                     conn,
                     int(match["challenger_id"]),
                     match["wager_amount"],
@@ -258,7 +282,13 @@ class ChallengeView(discord.ui.View):
         )
         start_view = MatchStartView(self.match_id, self.challenger_id, self.opponent_id)
         get_bot().add_view(start_view)
-        await interaction.response.edit_message(embed=embed, view=start_view)
+        await _edit_or_fallback(
+            interaction,
+            self.match_id,
+            embed,
+            start_view,
+            f"Challenge accepted for match `{self.match_id}`.",
+        )
         await log(
             f"✅ BATTLE ACCEPTED — Match ID: {self.match_id} | {fmt_user(challenger)} vs {fmt_user(opponent)} | Wager: {fmt(match['wager_amount'])}"
         )
@@ -296,7 +326,13 @@ class ChallengeView(discord.ui.View):
             description=f"{interaction.user.mention} declined the battle. Wager refunded.",
             color=discord.Color.red(),
         )
-        await interaction.response.edit_message(embed=embed, view=None)
+        await _edit_or_fallback(
+            interaction,
+            self.match_id,
+            embed,
+            None,
+            f"Challenge `{self.match_id}` declined. Wager refunded.",
+        )
         await log(
             f"❌ BATTLE DECLINED — Match ID: {self.match_id} | Declined by: {fmt_user(interaction.user)} | Wager refunded: {fmt(match['wager_amount'])}"
         )
@@ -375,7 +411,13 @@ class MatchStartView(discord.ui.View):
 
         view = MatchReportView(self.match_id, self.challenger_id, self.opponent_id)
         get_bot().add_view(view)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await _edit_or_fallback(
+            interaction,
+            self.match_id,
+            embed,
+            view,
+            f"Match `{self.match_id}` started. Bets are locked.",
+        )
         await log(f"🥊 MATCH STARTED — Match ID: {self.match_id} | Started by: {fmt_user(interaction.user)}")
 
 

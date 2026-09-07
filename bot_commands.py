@@ -1,6 +1,8 @@
 from datetime import timedelta
+import asyncio
 import traceback
 
+import asyncpg
 import discord
 from discord import option
 
@@ -27,9 +29,11 @@ from bot_helpers import (
     has_mod_role,
     lock_match,
     lock_user,
+    lock_users_ordered,
     log,
     now_utc,
     release_escrow,
+    release_escrow_up_to,
     run_payout,
     spendable,
     update_match_message,
@@ -75,7 +79,7 @@ def register_commands(bot: discord.Bot):
                     "**/forcebattle** — [MOD] Create a battle for two users without needing acceptance.",
                     "**/forceaccept** — [MOD] Accept a pending battle for the users.",
                     "**/forcecancel** — [MOD] Cancel a pending battle for the users.",
-                    "**/cancelactives** — [MOD] Cancel all open matches and refund wagers/bets.",
+                    "**/cancelactives** — [MOD] Cancel all open player and team matches and refund wagers/bets.",
                     "**/match** — [MOD] Create a team (role) match people can bet on.",
                 ])
 
@@ -109,13 +113,16 @@ def register_commands(bot: discord.Bot):
 
             await ctx.defer()
 
+            match_created = False
+            match_id = None
             try:
                 async with get_db_pool().acquire() as conn:
                     async with conn.transaction():
                         await ensure_user(conn, ctx.author.id)
                         await ensure_user(conn, opponent.id)
-                        challenger_row = await lock_user(conn, ctx.author.id)
-                        opponent_row = await lock_user(conn, opponent.id)
+                        locked = await lock_users_ordered(conn, ctx.author.id, opponent.id)
+                        challenger_row = locked.get(ctx.author.id)
+                        opponent_row = locked.get(opponent.id)
                         if not challenger_row or not opponent_row:
                             return await ctx.followup.send(
                                 "Could not load balances. Please try again.",
@@ -165,6 +172,7 @@ def register_commands(bot: discord.Bot):
                             str(ctx.channel_id),
                             now_utc(),
                         )
+                        match_created = True
             except InsufficientFundsError:
                 return await ctx.followup.send(
                     f"You have insufficient funds to create this battle for {fmt(amount)}.",
@@ -182,10 +190,45 @@ def register_commands(bot: discord.Bot):
             view = ChallengeView(match_id, ctx.author.id, opponent.id)
             get_bot().add_view(view)
             schedule_challenge_expiry(match_id)
-            msg = await ctx.followup.send(embed=embed, view=view, wait=True)
-            if msg:
+            try:
+                msg = await ctx.followup.send(embed=embed, view=view, wait=True)
+                if not msg:
+                    raise RuntimeError("Failed to post challenge message")
                 async with get_db_pool().acquire() as conn:
-                    await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
+                    for _ in range(3):
+                        try:
+                            await conn.execute(
+                                "UPDATE matches SET message_id = $1 WHERE match_id = $2",
+                                str(msg.id),
+                                match_id,
+                            )
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.25)
+                    else:
+                        await log(
+                            f"⚠️ MESSAGE ID SAVE FAILED — Match ID: {match_id} | Message was posted but message_id was not saved"
+                        )
+            except Exception:
+                if match_created and match_id:
+                    cancel_challenge_expiry_task(match_id)
+                    async with get_db_pool().acquire() as conn:
+                        async with conn.transaction():
+                            cancelled = await cancel_match_if_pending(conn, match_id)
+                            if cancelled:
+                                await release_escrow_up_to(
+                                    conn,
+                                    ctx.author.id,
+                                    amount,
+                                    f"battle create rollback (match {match_id})",
+                                    fmt_user(ctx.author),
+                                )
+                    await ctx.followup.send(
+                        "Could not post the battle message, so the challenge was cancelled and your wager was refunded.",
+                        ephemeral=True,
+                    )
+                    return
+                raise
 
             await log(
                 f"⚔️ BATTLE CREATED — Challenger: {fmt_user(ctx.author)} vs Opponent: {fmt_user(opponent)} | Wager: {fmt(amount)} | Match ID: {match_id}"
@@ -379,6 +422,11 @@ def register_commands(bot: discord.Bot):
                             str(player.id),
                             amount,
                         )
+                except asyncpg.UniqueViolationError:
+                    return await ctx.respond(
+                        "You already have an active bet on this match. Use `/cancelbet` to change it.",
+                        ephemeral=True,
+                    )
                 except InsufficientFundsError:
                     return await ctx.respond(f"Insufficient funds. You can't bet {fmt(amount)}.", ephemeral=True)
 
@@ -415,7 +463,10 @@ def register_commands(bot: discord.Bot):
                     await ensure_user(conn, ctx.author.id)
                     await ensure_user(conn, user.id)
 
-                    sender_row = await lock_user(conn, ctx.author.id)
+                    locked = await lock_users_ordered(conn, ctx.author.id, user.id)
+                    sender_row = locked.get(ctx.author.id)
+                    if not sender_row or locked.get(user.id) is None:
+                        return await ctx.respond("Could not load balances. Please try again.", ephemeral=True)
                     sender_available = spendable(sender_row)
                     if sender_available < amount:
                         return await ctx.respond(
@@ -439,7 +490,6 @@ def register_commands(bot: discord.Bot):
                             ephemeral=True,
                         )
 
-                    await lock_user(conn, user.id)
                     await conn.execute(
                         "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
                         amount,

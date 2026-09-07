@@ -1,5 +1,7 @@
+import asyncio
 import traceback
 
+import asyncpg
 import discord
 from discord import option
 
@@ -13,6 +15,7 @@ from bot_helpers import (
     build_team_match_embed,
     cancel_match_if_pending,
     cancel_open_match_with_refunds,
+    cancel_team_match_with_refunds,
     debit_escrow,
     enforce_channel,
     ensure_user,
@@ -25,13 +28,16 @@ from bot_helpers import (
     has_mod_role,
     lock_match,
     lock_user,
+    lock_users_ordered,
     log,
     now_utc,
     release_escrow,
+    release_escrow_up_to,
     restore_match_to_pre_payout,
     run_payout,
     spendable,
     update_match_message,
+    update_team_match_message,
 )
 from bot_views import MatchStartView, cancel_challenge_expiry_task
 from bot_team_matches import TeamMatchOpenView
@@ -57,13 +63,16 @@ def register_admin_commands(bot: discord.Bot):
 
             await ctx.defer()
 
+            match_created = False
+            match_id = None
             try:
                 async with get_db_pool().acquire() as conn:
                     async with conn.transaction():
                         await ensure_user(conn, player_one.id)
                         await ensure_user(conn, player_two.id)
-                        player_one_row = await lock_user(conn, player_one.id)
-                        player_two_row = await lock_user(conn, player_two.id)
+                        locked = await lock_users_ordered(conn, player_one.id, player_two.id)
+                        player_one_row = locked.get(player_one.id)
+                        player_two_row = locked.get(player_two.id)
                         if not player_one_row or not player_two_row:
                             return await ctx.followup.send(
                                 "Could not load one of the players' balances. Please try again.",
@@ -111,6 +120,7 @@ def register_admin_commands(bot: discord.Bot):
                             now_utc(),
                             now_utc(),
                         )
+                        match_created = True
             except InsufficientFundsError:
                 return await ctx.followup.send(
                     "One of the players no longer has enough available funds for this battle.",
@@ -133,10 +143,55 @@ def register_admin_commands(bot: discord.Bot):
 
             view = MatchStartView(match_id, player_one.id, player_two.id)
             get_bot().add_view(view)
-            msg = await ctx.followup.send(embed=embed, view=view, ephemeral=False, wait=True)
-            if msg:
+            try:
+                msg = await ctx.followup.send(embed=embed, view=view, ephemeral=False, wait=True)
+                if not msg:
+                    raise RuntimeError("Failed to post forced battle message")
                 async with get_db_pool().acquire() as conn:
-                    await conn.execute("UPDATE matches SET message_id = $1 WHERE match_id = $2", str(msg.id), match_id)
+                    for _ in range(3):
+                        try:
+                            await conn.execute(
+                                "UPDATE matches SET message_id = $1 WHERE match_id = $2",
+                                str(msg.id),
+                                match_id,
+                            )
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.25)
+                    else:
+                        await log(
+                            f"⚠️ MESSAGE ID SAVE FAILED — Forced Match ID: {match_id} | Message was posted but message_id was not saved"
+                        )
+            except Exception:
+                if match_created and match_id:
+                    async with get_db_pool().acquire() as conn:
+                        async with conn.transaction():
+                            cancelled = await conn.fetchrow(
+                                """
+                                UPDATE matches
+                                SET status = 'CANCELLED'
+                                WHERE match_id = $1 AND status = 'ACCEPTED'
+                                RETURNING *
+                                """,
+                                match_id,
+                            )
+                            if cancelled:
+                                await release_escrow_up_to(
+                                    conn, player_one.id, amount,
+                                    f"forced battle create rollback (match {match_id})",
+                                    fmt_user(player_one),
+                                )
+                                await release_escrow_up_to(
+                                    conn, player_two.id, amount,
+                                    f"forced battle create rollback (match {match_id})",
+                                    fmt_user(player_two),
+                                )
+                    await ctx.followup.send(
+                        "Could not post the battle message, so the forced battle was cancelled and wagers were refunded.",
+                        ephemeral=True,
+                    )
+                    return
+                raise
 
             await log(
                 f"⚔️ FORCED BATTLE CREATED — Mod: {fmt_user(ctx.author)} | {fmt_user(player_one)} vs {fmt_user(player_two)} | Wager: {fmt(amount)} | Match ID: {match_id}"
@@ -505,7 +560,7 @@ def register_admin_commands(bot: discord.Bot):
                 await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /resolve | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
-    @bot.slash_command(description="[MOD] Cancel all open matches and refund wagers/bets")
+    @bot.slash_command(description="[MOD] Cancel all open player/team matches and refund wagers/bets")
     async def cancelactives(ctx: discord.ApplicationContext):
         try:
             if not await enforce_channel(ctx):
@@ -516,8 +571,10 @@ def register_admin_commands(bot: discord.Bot):
             await ctx.defer(ephemeral=True)
 
             cancelled_matches = []
+            cancelled_team_matches = []
             total_player_refunds = 0
             total_bet_refunds = 0
+            total_team_bet_refunds = 0
 
             try:
                 async with get_db_pool().acquire() as conn:
@@ -531,9 +588,18 @@ def register_admin_commands(bot: discord.Bot):
                             FOR UPDATE
                             """
                         )
-                        if not matches:
+                        team_matches = await conn.fetch(
+                            """
+                            SELECT *
+                            FROM team_matches
+                            WHERE status IN ('OPEN', 'ACTIVE')
+                            ORDER BY created_at ASC
+                            FOR UPDATE
+                            """
+                        )
+                        if not matches and not team_matches:
                             return await ctx.followup.send(
-                                "There are no open matches (PENDING, ACCEPTED, or ACTIVE) to clear.",
+                                "There are no open player or team matches to clear.",
                                 ephemeral=True,
                             )
 
@@ -542,6 +608,11 @@ def register_admin_commands(bot: discord.Bot):
                             total_player_refunds += player_refunds
                             total_bet_refunds += bet_refunds
                             cancelled_matches.append(match)
+
+                        for team_match in team_matches:
+                            team_bet_refunds = await cancel_team_match_with_refunds(conn, team_match["match_id"])
+                            total_team_bet_refunds += team_bet_refunds
+                            cancelled_team_matches.append(team_match)
             except InsufficientFundsError as e:
                 await log(f"❌ ERROR — /cancelactives refund failed: {e}")
                 return await ctx.followup.send(
@@ -556,20 +627,34 @@ def register_admin_commands(bot: discord.Bot):
                 cancel_challenge_expiry_task(match["match_id"])
                 await update_match_message(match["match_id"], embed, view=None)
 
-            match_ids = ", ".join(f"`{m['match_id']}`" for m in cancelled_matches[:20])
-            if len(cancelled_matches) > 20:
-                match_ids += f", … (+{len(cancelled_matches) - 20} more)"
+            for team_match in cancelled_team_matches:
+                cleared_embed = discord.Embed(
+                    title="🏟️ Team Match — Cancelled",
+                    description="A moderator cleared all open matches. Pending bets were refunded.",
+                    color=discord.Color.dark_gray(),
+                )
+                cleared_embed.add_field(name="Match ID", value=f"`{team_match['match_id']}`", inline=True)
+                await update_team_match_message(team_match["match_id"], cleared_embed, view=None)
+
+            player_ids = ", ".join(f"`{m['match_id']}`" for m in cancelled_matches[:15])
+            if len(cancelled_matches) > 15:
+                player_ids += f", … (+{len(cancelled_matches) - 15} more)"
+            team_ids = ", ".join(f"`{m['match_id']}`" for m in cancelled_team_matches[:15])
+            if len(cancelled_team_matches) > 15:
+                team_ids += f", … (+{len(cancelled_team_matches) - 15} more)"
 
             await ctx.followup.send(
-                f"Cleared **{len(cancelled_matches)}** open match(es). "
-                f"Refunded **{total_player_refunds}** player wager(s) and **{total_bet_refunds}** bet(s).\n"
-                f"Matches: {match_ids}",
+                f"Cleared **{len(cancelled_matches)}** player match(es) and **{len(cancelled_team_matches)}** team match(es).\n"
+                f"Refunded **{total_player_refunds}** player wager(s), **{total_bet_refunds}** spectator bet(s), "
+                f"and **{total_team_bet_refunds}** team bet(s).\n"
+                f"Player matches: {player_ids or 'none'}\n"
+                f"Team matches: {team_ids or 'none'}",
                 ephemeral=True,
             )
             await log(
-                f"🧹 OPEN MATCHES CLEARED — Mod: {fmt_user(ctx.author)} | Matches: {len(cancelled_matches)} | "
-                f"Player refunds: {total_player_refunds} | Bet refunds: {total_bet_refunds} | "
-                f"IDs: {', '.join(m['match_id'] for m in cancelled_matches)}"
+                f"🧹 OPEN MATCHES CLEARED — Mod: {fmt_user(ctx.author)} | Player matches: {len(cancelled_matches)} | "
+                f"Team matches: {len(cancelled_team_matches)} | Player refunds: {total_player_refunds} | "
+                f"Bet refunds: {total_bet_refunds} | Team bet refunds: {total_team_bet_refunds}"
             )
 
         except Exception:
@@ -596,6 +681,7 @@ def register_admin_commands(bot: discord.Bot):
             await ctx.defer()
 
             match_id = gen_id()
+            match_created = False
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     while await conn.fetchrow("SELECT 1 FROM team_matches WHERE match_id = $1", match_id):
@@ -614,6 +700,7 @@ def register_admin_commands(bot: discord.Bot):
                         str(ctx.channel_id),
                         now_utc(),
                     )
+                    match_created = True
 
             view = TeamMatchOpenView(match_id, team_one.id, team_two.id)
             get_bot().add_view(view)
@@ -631,14 +718,36 @@ def register_admin_commands(bot: discord.Bot):
                 elif isinstance(child, discord.ui.Button) and child.custom_id == f"team_bet:{match_id}:{team_two.id}":
                     child.label = f"Bet on {team_two.name}"[:80]
 
-            msg = await ctx.followup.send(embed=embed, view=view, wait=True)
-            if msg:
+            try:
+                msg = await ctx.followup.send(embed=embed, view=view, wait=True)
+                if not msg:
+                    raise RuntimeError("Failed to post team match message")
                 async with get_db_pool().acquire() as conn:
-                    await conn.execute(
-                        "UPDATE team_matches SET message_id = $1 WHERE match_id = $2",
-                        str(msg.id),
-                        match_id,
+                    for _ in range(3):
+                        try:
+                            await conn.execute(
+                                "UPDATE team_matches SET message_id = $1 WHERE match_id = $2",
+                                str(msg.id),
+                                match_id,
+                            )
+                            break
+                        except Exception:
+                            await asyncio.sleep(0.25)
+                    else:
+                        await log(
+                            f"⚠️ MESSAGE ID SAVE FAILED — Team Match ID: {match_id} | Message was posted but message_id was not saved"
+                        )
+            except Exception:
+                if match_created and match_id:
+                    async with get_db_pool().acquire() as conn:
+                        async with conn.transaction():
+                            await cancel_team_match_with_refunds(conn, match_id)
+                    await ctx.followup.send(
+                        "Could not post the team match message, so the match was cancelled.",
+                        ephemeral=True,
                     )
+                    return
+                raise
 
             await log(
                 f"🏟️ TEAM MATCH CREATED — Mod: {fmt_user(ctx.author)} | {team_one.name} vs {team_two.name} | Match ID: {match_id}"
