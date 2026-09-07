@@ -10,6 +10,7 @@ from bot_helpers import (
     DAILY_AMOUNT,
     MIN_BATTLE_WAGER,
     InsufficientFundsError,
+    build_open_matches_embed,
     build_top_embed,
     cancel_match_if_pending,
     complete_match_if_active,
@@ -61,6 +62,7 @@ def register_commands(bot: discord.Bot):
                 f"**/give** — Give some of your {CURRENCY_NAME} to another user.",
                 f"**/daily** — Claim your daily {fmt(DAILY_AMOUNT)} {CURRENCY_NAME}.",
                 "**/top** — View the money leaderboard.",
+                "**/openmatches** — List all open battles.",
                 "**/cancelbattle** — Cancel a pending battle you created.",
                 "**/cancelbet** — Cancel your pending bet before the match starts.",
             ]
@@ -561,6 +563,19 @@ def register_commands(bot: discord.Bot):
         except Exception:
             await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /top | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+    @bot.slash_command(description="List all open battles (pending, accepted, and active)")
+    @option("page", int, description="Page number", required=False)
+    async def openmatches(ctx: discord.ApplicationContext, page: int = 1):
+        try:
+            if not await enforce_channel(ctx):
+                return
+            page = max(1, page)
+            embed, _total_pages = await build_open_matches_embed(page)
+            await ctx.respond(embed=embed)
+        except Exception:
+            await ctx.respond("Something went wrong.", ephemeral=True)
+            await log(f"❌ ERROR — Command: /openmatches | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
     @bot.slash_command(description="Cancel a battle you created (before it's accepted)")
     @option("match_id", str, description="The match ID to cancel")

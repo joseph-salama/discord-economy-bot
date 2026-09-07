@@ -399,6 +399,72 @@ async def build_cancelled_match_embed(description: str) -> discord.Embed:
     )
 
 
+async def build_open_matches_embed(page: int = 1) -> tuple[discord.Embed, int]:
+    """Build a paginated embed of PENDING / ACCEPTED / ACTIVE matches."""
+    page_size = 10
+    async with get_db_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT match_id, challenger_id, opponent_id, wager_amount, status, created_at
+            FROM matches
+            WHERE status IN ('PENDING', 'ACCEPTED', 'ACTIVE')
+            ORDER BY
+                CASE status
+                    WHEN 'ACTIVE' THEN 1
+                    WHEN 'ACCEPTED' THEN 2
+                    WHEN 'PENDING' THEN 3
+                    ELSE 4
+                END,
+                created_at ASC
+            """
+        )
+
+    total = len(rows)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    page_rows = rows[start : start + page_size]
+
+    status_counts = {"ACTIVE": 0, "ACCEPTED": 0, "PENDING": 0}
+    for row in rows:
+        status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+
+    embed = discord.Embed(
+        title="📋 Open Matches",
+        color=discord.Color.teal(),
+    )
+    embed.set_footer(
+        text=(
+            f"Page {page}/{total_pages} • {total} open • "
+            f"Active {status_counts['ACTIVE']} • Accepted {status_counts['ACCEPTED']} • Pending {status_counts['PENDING']}"
+        )
+    )
+
+    if not page_rows:
+        embed.description = "There are no open matches right now."
+        return embed, total_pages
+
+    lines = []
+    for row in page_rows:
+        challenger = await get_display_name(row["challenger_id"])
+        opponent = await get_display_name(row["opponent_id"])
+        status = row["status"]
+        if status == "ACTIVE":
+            status_label = "🟢 ACTIVE"
+        elif status == "ACCEPTED":
+            status_label = "🟡 ACCEPTED"
+        else:
+            status_label = "🟠 PENDING"
+
+        lines.append(
+            f"**`{row['match_id']}`** · {status_label}\n"
+            f"{challenger} vs {opponent} · Wager {fmt(row['wager_amount'])}"
+        )
+
+    embed.description = "\n\n".join(lines)
+    return embed, total_pages
+
+
 async def find_open_match_between(conn, user_one_id: int, user_two_id: int) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
