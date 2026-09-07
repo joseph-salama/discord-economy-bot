@@ -5,6 +5,7 @@ from discord.ext import tasks
 from bot_commands import register_commands
 from bot_helpers import init_database, log, reward_queue_match, set_bot, set_db_pool, get_db_pool
 from bot_views import expire_stale_challenges, restore_persistent_views
+from bot_team_matches import restore_team_match_views
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -51,6 +52,7 @@ async def on_ready():
         async with db_pool.acquire() as conn:
             await init_database(conn)
         await restore_persistent_views()
+        await restore_team_match_views()
         print(f"✅ Logged in as {bot.user} | DB connected")
         await log(f"🤖 Bot started and ready — {bot.user}")
         if not keepalive.is_running():

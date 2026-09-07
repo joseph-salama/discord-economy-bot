@@ -10,6 +10,7 @@ from bot_helpers import (
     PayoutReverseError,
     build_accepted_match_embed,
     build_cancelled_match_embed,
+    build_team_match_embed,
     cancel_match_if_pending,
     cancel_open_match_with_refunds,
     debit_escrow,
@@ -33,6 +34,7 @@ from bot_helpers import (
     update_match_message,
 )
 from bot_views import MatchStartView, cancel_challenge_expiry_task
+from bot_team_matches import TeamMatchOpenView
 
 
 def register_admin_commands(bot: discord.Bot):
@@ -576,3 +578,75 @@ def register_admin_commands(bot: discord.Bot):
             else:
                 await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /cancelactives | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+    @bot.slash_command(description="[MOD] Create a team match between two roles for spectator betting")
+    @option("team_one", discord.Role, description="First team role")
+    @option("team_two", discord.Role, description="Second team role")
+    async def match(ctx: discord.ApplicationContext, team_one: discord.Role, team_two: discord.Role):
+        try:
+            if not await enforce_channel(ctx):
+                return
+            if not has_mod_role(ctx):
+                return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+            if team_one.id == team_two.id:
+                return await ctx.respond("Choose two different team roles.", ephemeral=True)
+            if team_one.is_default() or team_two.is_default():
+                return await ctx.respond("You cannot use @everyone as a team role.", ephemeral=True)
+
+            await ctx.defer()
+
+            match_id = gen_id()
+            async with get_db_pool().acquire() as conn:
+                async with conn.transaction():
+                    while await conn.fetchrow("SELECT 1 FROM team_matches WHERE match_id = $1", match_id):
+                        match_id = gen_id()
+                    await conn.execute(
+                        """
+                        INSERT INTO team_matches (
+                            match_id, role_one_id, role_two_id, status, created_by_id, channel_id, created_at
+                        )
+                        VALUES ($1, $2, $3, 'OPEN', $4, $5, $6)
+                        """,
+                        match_id,
+                        str(team_one.id),
+                        str(team_two.id),
+                        str(ctx.author.id),
+                        str(ctx.channel_id),
+                        now_utc(),
+                    )
+
+            view = TeamMatchOpenView(match_id, team_one.id, team_two.id)
+            get_bot().add_view(view)
+            embed = await build_team_match_embed(
+                match_id,
+                team_one.id,
+                team_two.id,
+                "OPEN",
+                created_by_text=f"Created by {fmt_user(ctx.author)} | Match `{match_id}`",
+            )
+            # Show role names on buttons when possible
+            for child in view.children:
+                if isinstance(child, discord.ui.Button) and child.custom_id == f"team_bet:{match_id}:{team_one.id}":
+                    child.label = f"Bet on {team_one.name}"[:80]
+                elif isinstance(child, discord.ui.Button) and child.custom_id == f"team_bet:{match_id}:{team_two.id}":
+                    child.label = f"Bet on {team_two.name}"[:80]
+
+            msg = await ctx.followup.send(embed=embed, view=view, wait=True)
+            if msg:
+                async with get_db_pool().acquire() as conn:
+                    await conn.execute(
+                        "UPDATE team_matches SET message_id = $1 WHERE match_id = $2",
+                        str(msg.id),
+                        match_id,
+                    )
+
+            await log(
+                f"🏟️ TEAM MATCH CREATED — Mod: {fmt_user(ctx.author)} | {team_one.name} vs {team_two.name} | Match ID: {match_id}"
+            )
+
+        except Exception:
+            if ctx.response.is_done():
+                await ctx.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await ctx.respond("Something went wrong.", ephemeral=True)
+            await log(f"❌ ERROR — Command: /match | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")

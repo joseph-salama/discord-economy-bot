@@ -29,6 +29,7 @@ ALLOWED_CHANNEL_ID = _env_int("ALLOWED_CHANNEL_ID", 1494473065281617971)
 DAILY_AMOUNT = 50
 STARTING_BALANCE = 250
 MIN_BATTLE_WAGER = 100
+MIN_TEAM_BET = 1
 CHALLENGE_TIMEOUT_SECONDS = 300
 MODERATOR_ROLE_ID = _env_int("MODERATOR_ROLE_ID", 1494455406691483658)
 LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID", 1494449437240463451)
@@ -290,6 +291,12 @@ def has_mod_role(ctx: discord.ApplicationContext) -> bool:
     return False
 
 
+def member_has_mod_role(user: discord.Member | discord.User | None) -> bool:
+    if isinstance(user, discord.Member):
+        return any(r.id == MODERATOR_ROLE_ID for r in user.roles)
+    return False
+
+
 async def enforce_channel(ctx: discord.ApplicationContext) -> bool:
     if ALLOWED_CHANNEL_ID and ctx.channel_id != ALLOWED_CHANNEL_ID:
         allowed_mention = f"<#{ALLOWED_CHANNEL_ID}>"
@@ -441,27 +448,53 @@ async def build_open_matches_embed(page: int = 1) -> tuple[discord.Embed, int]:
     )
 
     if not page_rows:
-        embed.description = "There are no open matches right now."
-        return embed, total_pages
+        embed.description = "There are no open player battles right now."
+    else:
+        lines = []
+        for row in page_rows:
+            challenger = await get_display_name(row["challenger_id"])
+            opponent = await get_display_name(row["opponent_id"])
+            status = row["status"]
+            if status == "ACTIVE":
+                status_label = "🟢 ACTIVE"
+            elif status == "ACCEPTED":
+                status_label = "🟡 ACCEPTED"
+            else:
+                status_label = "🟠 PENDING"
 
-    lines = []
-    for row in page_rows:
-        challenger = await get_display_name(row["challenger_id"])
-        opponent = await get_display_name(row["opponent_id"])
-        status = row["status"]
-        if status == "ACTIVE":
-            status_label = "🟢 ACTIVE"
-        elif status == "ACCEPTED":
-            status_label = "🟡 ACCEPTED"
-        else:
-            status_label = "🟠 PENDING"
+            lines.append(
+                f"**`{row['match_id']}`** · {status_label}\n"
+                f"{challenger} vs {opponent} · Wager {fmt(row['wager_amount'])}"
+            )
+        embed.description = "\n\n".join(lines)
 
-        lines.append(
-            f"**`{row['match_id']}`** · {status_label}\n"
-            f"{challenger} vs {opponent} · Wager {fmt(row['wager_amount'])}"
+    async with get_db_pool().acquire() as conn:
+        team_rows = await conn.fetch(
+            """
+            SELECT match_id, role_one_id, role_two_id, status
+            FROM team_matches
+            WHERE status IN ('OPEN', 'ACTIVE')
+            ORDER BY
+                CASE status WHEN 'ACTIVE' THEN 1 WHEN 'OPEN' THEN 2 ELSE 3 END,
+                created_at ASC
+            LIMIT 10
+            """
         )
 
-    embed.description = "\n\n".join(lines)
+    if team_rows:
+        team_lines = []
+        for row in team_rows:
+            status_label = "🟢 ACTIVE" if row["status"] == "ACTIVE" else "🟠 OPEN"
+            team_lines.append(
+                f"**`{row['match_id']}`** · {status_label}\n"
+                f"{await get_role_mention(row['role_one_id'])} vs {await get_role_mention(row['role_two_id'])}"
+            )
+        embed.add_field(
+            name="Team Matches",
+            value="\n\n".join(team_lines),
+            inline=False,
+        )
+
     return embed, total_pages
 
 
@@ -530,6 +563,34 @@ async def init_database(conn):
         CREATE TABLE IF NOT EXISTS rewarded_queue_messages (
             message_id TEXT PRIMARY KEY,
             rewarded_at TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_matches (
+            match_id TEXT PRIMARY KEY,
+            role_one_id TEXT NOT NULL,
+            role_two_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            winner_role_id TEXT,
+            created_by_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            message_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            started_at TIMESTAMPTZ
+        )
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_bets (
+            bet_id TEXT PRIMARY KEY,
+            match_id TEXT NOT NULL REFERENCES team_matches(match_id),
+            bettor_id TEXT NOT NULL,
+            predicted_role_id TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING'
         )
         """
     )
@@ -846,3 +907,204 @@ async def cancel_open_match_with_refunds(conn, match) -> tuple[int, int]:
             bet_refunds += 1
 
     return player_refunds, bet_refunds
+
+
+async def lock_team_match(conn, match_id: str) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        "SELECT * FROM team_matches WHERE match_id = $1 FOR UPDATE",
+        match_id,
+    )
+
+
+async def get_team_bet_totals(conn, match_id: str) -> dict[str, int]:
+    rows = await conn.fetch(
+        """
+        SELECT predicted_role_id, COALESCE(SUM(amount), 0) AS total, COUNT(*)::int AS bet_count
+        FROM team_bets
+        WHERE match_id = $1 AND status = 'PENDING'
+        GROUP BY predicted_role_id
+        """,
+        match_id,
+    )
+    return {row["predicted_role_id"]: int(row["total"]) for row in rows}
+
+
+async def get_role_mention(role_id: str | int) -> str:
+    return f"<@&{role_id}>"
+
+
+async def build_team_match_embed(
+    match_id: str,
+    role_one_id: int,
+    role_two_id: int,
+    status: str,
+    *,
+    created_by_text: str | None = None,
+    winner_role_id: int | None = None,
+) -> discord.Embed:
+    async with get_db_pool().acquire() as conn:
+        totals = await get_team_bet_totals(conn, match_id)
+        pending_bets = await conn.fetchval(
+            "SELECT COUNT(*) FROM team_bets WHERE match_id = $1 AND status = 'PENDING'",
+            match_id,
+        ) or 0
+
+    role_one_total = totals.get(str(role_one_id), 0)
+    role_two_total = totals.get(str(role_two_id), 0)
+
+    if status == "OPEN":
+        title = "🏟️ Team Match — Bets Open"
+        color = discord.Color.orange()
+        status_text = "Place a bet with the buttons below. A moderator will start the match to lock bets."
+    elif status == "ACTIVE":
+        title = "🏟️ Team Match — In Progress"
+        color = discord.Color.blue()
+        status_text = "Bets are locked. A moderator will declare the winner when the match ends."
+    elif status == "COMPLETED":
+        title = "🏟️ Team Match — Complete"
+        color = discord.Color.gold()
+        winner = await get_role_mention(winner_role_id) if winner_role_id else "Unknown"
+        status_text = f"Winner: {winner}"
+    else:
+        title = "🏟️ Team Match — Cancelled"
+        color = discord.Color.dark_gray()
+        status_text = "This team match was cancelled. Pending bets were refunded."
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Team 1", value=await get_role_mention(role_one_id), inline=True)
+    embed.add_field(name="Team 2", value=await get_role_mention(role_two_id), inline=True)
+    embed.add_field(name="Match ID", value=f"`{match_id}`", inline=True)
+    embed.add_field(name="Bets on Team 1", value=fmt(role_one_total), inline=True)
+    embed.add_field(name="Bets on Team 2", value=fmt(role_two_total), inline=True)
+    embed.add_field(name="Open Bets", value=str(pending_bets), inline=True)
+    embed.add_field(name="Status", value=status_text, inline=False)
+    if created_by_text:
+        embed.set_footer(text=created_by_text)
+    return embed
+
+
+async def update_team_match_message(match_id: str, embed: discord.Embed, view: discord.ui.View | None = None):
+    async with get_db_pool().acquire() as conn:
+        match = await conn.fetchrow(
+            "SELECT channel_id, message_id FROM team_matches WHERE match_id = $1",
+            match_id,
+        )
+    if not match or not match["message_id"]:
+        return
+
+    channel = get_bot().get_channel(int(match["channel_id"]))
+    if channel is None:
+        try:
+            channel = await get_bot().fetch_channel(int(match["channel_id"]))
+        except Exception:
+            return
+
+    try:
+        msg = await channel.fetch_message(int(match["message_id"]))
+        await msg.edit(embed=embed, view=view)
+    except Exception:
+        pass
+
+
+async def run_team_match_payout(conn, match_id: str, winner_role_id: str, mod_tag: str | None = None) -> discord.Embed:
+    match = await conn.fetchrow("SELECT * FROM team_matches WHERE match_id = $1", match_id)
+    role_one_id = match["role_one_id"]
+    role_two_id = match["role_two_id"]
+    loser_role_id = role_two_id if winner_role_id == role_one_id else role_one_id
+
+    bets = await conn.fetch(
+        "SELECT * FROM team_bets WHERE match_id = $1 AND status = 'PENDING'",
+        match_id,
+    )
+    bet_lines = []
+    for bet in bets:
+        bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
+        if bet["predicted_role_id"] == winner_role_id:
+            await release_escrow(
+                conn,
+                int(bet["bettor_id"]),
+                bet["amount"],
+                "team bet won (escrow released)",
+                fmt_user(bettor),
+            )
+            await credit(
+                conn,
+                int(bet["bettor_id"]),
+                bet["amount"],
+                "team bet won (winnings)",
+                fmt_user(bettor),
+            )
+            await conn.execute("UPDATE team_bets SET status = 'WON' WHERE bet_id = $1", bet["bet_id"])
+            bet_lines.append(
+                f"  ✅ {fmt_user(bettor)} bet {fmt(bet['amount'])} on {await get_role_mention(winner_role_id)} → Won {fmt(bet['amount'])}"
+            )
+        else:
+            await burn_escrow(
+                conn,
+                int(bet["bettor_id"]),
+                bet["amount"],
+                "team bet lost",
+                fmt_user(bettor),
+            )
+            await conn.execute("UPDATE team_bets SET status = 'LOST' WHERE bet_id = $1", bet["bet_id"])
+            bet_lines.append(
+                f"  ❌ {fmt_user(bettor)} bet {fmt(bet['amount'])} on {await get_role_mention(loser_role_id)} → Lost"
+            )
+
+    embed = discord.Embed(title="🏟️ Team Match Complete!", color=discord.Color.gold())
+    embed.add_field(name="Match ID", value=match_id, inline=True)
+    embed.add_field(name="Winner", value=await get_role_mention(winner_role_id), inline=True)
+    if bet_lines:
+        # Discord field value max 1024 chars
+        text = "\n".join(bet_lines)
+        if len(text) > 1000:
+            text = text[:1000] + "\n…"
+        embed.add_field(name="Bet Outcomes", value=text, inline=False)
+    else:
+        embed.add_field(name="Bet Outcomes", value="No bets were placed.", inline=False)
+    if mod_tag:
+        embed.set_footer(text=f"Resolved by mod: {mod_tag}")
+
+    await log(
+        f"🏆 TEAM MATCH COMPLETED — Match ID: {match_id} | Winner role: {winner_role_id} | Bets: {len(bets)}"
+        + (f" | By: {mod_tag}" if mod_tag else "")
+    )
+    return embed
+
+
+async def cancel_team_match_with_refunds(conn, match_id: str) -> int:
+    """Cancel an OPEN/ACTIVE team match and refund pending bets. Returns bet refund count."""
+    cancelled = await conn.fetchrow(
+        """
+        UPDATE team_matches
+        SET status = 'CANCELLED'
+        WHERE match_id = $1 AND status IN ('OPEN', 'ACTIVE')
+        RETURNING *
+        """,
+        match_id,
+    )
+    if not cancelled:
+        return 0
+
+    bets = await conn.fetch(
+        """
+        SELECT * FROM team_bets
+        WHERE match_id = $1 AND status = 'PENDING'
+        FOR UPDATE
+        """,
+        match_id,
+    )
+    refunded = 0
+    for bet in bets:
+        bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
+        released = await release_escrow_up_to(
+            conn,
+            int(bet["bettor_id"]),
+            bet["amount"],
+            f"team bet refunded (match {match_id})",
+            fmt_user(bettor),
+        )
+        await conn.execute("DELETE FROM team_bets WHERE bet_id = $1", bet["bet_id"])
+        if released > 0:
+            refunded += 1
+    return refunded
