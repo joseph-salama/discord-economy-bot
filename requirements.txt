@@ -1,2 +1,2 @@
-py-cord
-asyncpg
+py-cord==2.8.0
+asyncpg==0.31.0

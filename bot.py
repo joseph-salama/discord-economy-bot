@@ -9,6 +9,11 @@ from bot_views import expire_stale_challenges, restore_persistent_views
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
+if not DISCORD_TOKEN:
+    raise SystemExit("DISCORD_TOKEN environment variable is required.")
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL environment variable is required.")
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -55,30 +60,23 @@ async def on_ready():
     except Exception as e:
         import traceback
         print(f"❌ FATAL on_ready error: {traceback.format_exc()}")
+        print("❌ Shutting down because the database failed to initialize.")
+        await bot.close()
 
 @bot.event
 async def on_message(message: discord.Message):
     try:
-        reward_queue_match
-    except Exception:
-        return
-
-    from bot_helpers import get_db_pool
-    try:
         get_db_pool()
     except RuntimeError:
         return
-
     await reward_queue_match(message)
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
-    from bot_helpers import get_db_pool
     try:
         get_db_pool()
     except RuntimeError:
         return
-
     await reward_queue_match(after)
 
 bot.run(DISCORD_TOKEN)

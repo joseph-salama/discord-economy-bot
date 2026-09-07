@@ -1,3 +1,4 @@
+import os
 import random
 import re
 import string
@@ -8,14 +9,33 @@ import discord
 
 CURRENCY_NAME = "Dollars"
 CURRENCY_SYMBOL = "$"
-ALLOWED_CHANNEL_ID = 1494473065281617971
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return int(str(raw).strip())
+
+
+def _env_int_set(name: str, default: set[int]) -> set[int]:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return set(default)
+    return {int(part.strip()) for part in str(raw).split(",") if part.strip()}
+
+
+ALLOWED_CHANNEL_ID = _env_int("ALLOWED_CHANNEL_ID", 1494473065281617971)
 DAILY_AMOUNT = 50
 STARTING_BALANCE = 250
 MIN_BATTLE_WAGER = 100
 CHALLENGE_TIMEOUT_SECONDS = 300
-MODERATOR_ROLE_ID = 1494455406691483658
-LOG_CHANNEL_ID = 1494449437240463451
-QUEUE_CHANNEL_IDS = {1478102174541025451, 989621653703098398}
+MODERATOR_ROLE_ID = _env_int("MODERATOR_ROLE_ID", 1494455406691483658)
+LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID", 1494449437240463451)
+QUEUE_CHANNEL_IDS = _env_int_set(
+    "QUEUE_CHANNEL_IDS",
+    {1478102174541025451, 989621653703098398},
+)
 MATCH_REWARD = 100
 TOP_PAGE_SIZE = 8
 
@@ -548,22 +568,31 @@ async def run_payout(conn, match_id: str, winner_id: str, mod_tag: str | None = 
 
 
 def parse_team_mentions(content: str) -> list[int]:
-    team_section = re.search(
-        r"Team 1\s*\n([\s\S]*?)Team 2\s*\n([\s\S]*?)(?:Match ID|$)",
-        content,
-        re.IGNORECASE,
-    )
-    if not team_section:
+    """Extract unique player IDs from Team 1 / Team 2 queue-bot text."""
+    if not content:
         return []
 
-    team1_block = team_section.group(1)
-    team2_block = team_section.group(2)
+    patterns = [
+        # Classic multiline blocks ending at Match ID
+        r"Team\s*1\s*:?\s*\n([\s\S]*?)Team\s*2\s*:?\s*\n([\s\S]*?)(?:Match\s*ID|$)",
+        # Same-line or loosely separated team sections
+        r"Team\s*1\s*:?\s*([\s\S]*?)Team\s*2\s*:?\s*([\s\S]*?)(?:Match\s*ID|$)",
+        # Team headers without requiring Match ID terminator
+        r"Team\s*1\s*:?\s*([\s\S]*?)Team\s*2\s*:?\s*([\s\S]+)",
+    ]
 
-    ids: list[int] = []
-    for block in (team1_block, team2_block):
-        ids.extend(int(m) for m in re.findall(r"<@!?(\d+)>", block))
+    for pattern in patterns:
+        team_section = re.search(pattern, content, re.IGNORECASE)
+        if not team_section:
+            continue
+        ids: list[int] = []
+        for block in team_section.groups():
+            ids.extend(int(m) for m in re.findall(r"<@!?(\d+)>", block or ""))
+        unique = list(dict.fromkeys(ids))
+        if unique:
+            return unique
 
-    return list(dict.fromkeys(ids))
+    return []
 
 
 async def reward_queue_match(message: discord.Message):
@@ -575,12 +604,21 @@ async def reward_queue_match(message: discord.Message):
     content = message.content or ""
     if not content:
         for embed in message.embeds:
+            content += f"\n{embed.title or ''}"
             content += f"\n{embed.description or ''}"
             for field in embed.fields:
                 content += f"\n{field.name}\n{field.value}"
 
     player_ids = parse_team_mentions(content)
     if not player_ids:
+        looks_like_queue = bool(re.search(r"team\s*1", content, re.IGNORECASE)) and bool(
+            re.search(r"team\s*2", content, re.IGNORECASE)
+        )
+        if looks_like_queue:
+            await log(
+                f"⚠️ QUEUE PARSE MISS — message {message.id} in #{getattr(message.channel, 'name', message.channel.id)} "
+                "looked like a queue match but no player mentions were parsed."
+            )
         return
 
     async with get_db_pool().acquire() as conn:
@@ -611,3 +649,80 @@ async def reward_queue_match(message: discord.Message):
     await log(
         f"🎮 QUEUE MATCH REWARD — {fmt(MATCH_REWARD)} granted to {len(player_ids)} players in #{message.channel.name}: {', '.join(rewarded_tags)}"
     )
+
+
+async def cancel_open_match_with_refunds(conn, match) -> tuple[int, int]:
+    """
+    Cancel one PENDING/ACCEPTED/ACTIVE match and refund escrows + pending bets.
+    Returns (player_refunds, bet_refunds).
+    """
+    match_id = match["match_id"]
+    status = match["status"]
+    wager = match["wager_amount"]
+
+    cancelled = await conn.fetchrow(
+        """
+        UPDATE matches
+        SET status = 'CANCELLED'
+        WHERE match_id = $1 AND status IN ('PENDING', 'ACCEPTED', 'ACTIVE')
+        RETURNING *
+        """,
+        match_id,
+    )
+    if not cancelled:
+        return 0, 0
+
+    player_refunds = 0
+    challenger_id = int(match["challenger_id"])
+    opponent_id = int(match["opponent_id"])
+    challenger = await get_bot().fetch_user(challenger_id)
+
+    if status == "PENDING":
+        await release_escrow(
+            conn,
+            challenger_id,
+            wager,
+            f"open matches cleared (match {match_id})",
+            fmt_user(challenger),
+        )
+        player_refunds = 1
+    else:
+        opponent = await get_bot().fetch_user(opponent_id)
+        await release_escrow(
+            conn,
+            challenger_id,
+            wager,
+            f"open matches cleared (match {match_id})",
+            fmt_user(challenger),
+        )
+        await release_escrow(
+            conn,
+            opponent_id,
+            wager,
+            f"open matches cleared (match {match_id})",
+            fmt_user(opponent),
+        )
+        player_refunds = 2
+
+    bets = await conn.fetch(
+        """
+        SELECT * FROM bets
+        WHERE match_id = $1 AND status = 'PENDING'
+        FOR UPDATE
+        """,
+        match_id,
+    )
+    bet_refunds = 0
+    for bet in bets:
+        bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
+        await release_escrow(
+            conn,
+            int(bet["bettor_id"]),
+            bet["amount"],
+            f"bet refunded — open matches cleared (match {match_id})",
+            fmt_user(bettor),
+        )
+        await conn.execute("DELETE FROM bets WHERE bet_id = $1", bet["bet_id"])
+        bet_refunds += 1
+
+    return player_refunds, bet_refunds

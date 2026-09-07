@@ -11,6 +11,7 @@ from bot_helpers import (
     build_accepted_match_embed,
     build_cancelled_match_embed,
     cancel_match_if_pending,
+    cancel_open_match_with_refunds,
     debit_escrow,
     enforce_channel,
     ensure_user,
@@ -501,3 +502,77 @@ def register_admin_commands(bot: discord.Bot):
             else:
                 await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /resolve | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
+
+    @bot.slash_command(description="[MOD] Cancel all open matches and refund wagers/bets")
+    async def cancelactives(ctx: discord.ApplicationContext):
+        try:
+            if not await enforce_channel(ctx):
+                return
+            if not has_mod_role(ctx):
+                return await ctx.respond("You don't have permission to use this command.", ephemeral=True)
+
+            await ctx.defer(ephemeral=True)
+
+            cancelled_matches = []
+            total_player_refunds = 0
+            total_bet_refunds = 0
+
+            try:
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        matches = await conn.fetch(
+                            """
+                            SELECT *
+                            FROM matches
+                            WHERE status IN ('PENDING', 'ACCEPTED', 'ACTIVE')
+                            ORDER BY created_at ASC
+                            FOR UPDATE
+                            """
+                        )
+                        if not matches:
+                            return await ctx.followup.send(
+                                "There are no open matches (PENDING, ACCEPTED, or ACTIVE) to clear.",
+                                ephemeral=True,
+                            )
+
+                        for match in matches:
+                            player_refunds, bet_refunds = await cancel_open_match_with_refunds(conn, match)
+                            total_player_refunds += player_refunds
+                            total_bet_refunds += bet_refunds
+                            cancelled_matches.append(match)
+            except InsufficientFundsError as e:
+                await log(f"❌ ERROR — /cancelactives refund failed: {e}")
+                return await ctx.followup.send(
+                    "Could not clear open matches because escrow was inconsistent. No matches were changed.",
+                    ephemeral=True,
+                )
+
+            embed = await build_cancelled_match_embed(
+                f"A moderator cleared all open matches. Player wagers and spectator bets have been refunded."
+            )
+            for match in cancelled_matches:
+                cancel_challenge_expiry_task(match["match_id"])
+                await update_match_message(match["match_id"], embed, view=None)
+
+            match_ids = ", ".join(f"`{m['match_id']}`" for m in cancelled_matches[:20])
+            if len(cancelled_matches) > 20:
+                match_ids += f", … (+{len(cancelled_matches) - 20} more)"
+
+            await ctx.followup.send(
+                f"Cleared **{len(cancelled_matches)}** open match(es). "
+                f"Refunded **{total_player_refunds}** player wager(s) and **{total_bet_refunds}** bet(s).\n"
+                f"Matches: {match_ids}",
+                ephemeral=True,
+            )
+            await log(
+                f"🧹 OPEN MATCHES CLEARED — Mod: {fmt_user(ctx.author)} | Matches: {len(cancelled_matches)} | "
+                f"Player refunds: {total_player_refunds} | Bet refunds: {total_bet_refunds} | "
+                f"IDs: {', '.join(m['match_id'] for m in cancelled_matches)}"
+            )
+
+        except Exception:
+            if ctx.response.is_done():
+                await ctx.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await ctx.respond("Something went wrong.", ephemeral=True)
+            await log(f"❌ ERROR — Command: /cancelactives | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")

@@ -73,6 +73,7 @@ def register_commands(bot: discord.Bot):
                     "**/forcebattle** — [MOD] Create a battle for two users without needing acceptance.",
                     "**/forceaccept** — [MOD] Accept a pending battle for the users.",
                     "**/forcecancel** — [MOD] Cancel a pending battle for the users.",
+                    "**/cancelactives** — [MOD] Cancel all open matches and refund wagers/bets.",
                 ])
 
             embed = discord.Embed(
