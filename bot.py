@@ -4,6 +4,7 @@ import discord
 from discord.ext import tasks
 from bot_commands import register_commands
 from bot_helpers import init_database, log, reward_queue_match, set_bot, set_db_pool, get_db_pool
+from bot_views import expire_stale_challenges, restore_persistent_views
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -25,6 +26,13 @@ async def keepalive():
     except Exception as e:
         print(f"⚠️ Keepalive ping failed: {e}")
 
+@tasks.loop(minutes=1)
+async def challenge_expiry_sweeper():
+    try:
+        await expire_stale_challenges()
+    except Exception as e:
+        print(f"⚠️ Challenge expiry sweeper failed: {e}")
+
 @bot.event
 async def on_ready():
     try:
@@ -37,10 +45,13 @@ async def on_ready():
         set_db_pool(db_pool)
         async with db_pool.acquire() as conn:
             await init_database(conn)
+        await restore_persistent_views()
         print(f"✅ Logged in as {bot.user} | DB connected")
         await log(f"🤖 Bot started and ready — {bot.user}")
         if not keepalive.is_running():
             keepalive.start()
+        if not challenge_expiry_sweeper.is_running():
+            challenge_expiry_sweeper.start()
     except Exception as e:
         import traceback
         print(f"❌ FATAL on_ready error: {traceback.format_exc()}")

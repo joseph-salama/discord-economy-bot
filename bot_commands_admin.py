@@ -31,7 +31,7 @@ from bot_helpers import (
     spendable,
     update_match_message,
 )
-from bot_views import MatchStartView
+from bot_views import MatchStartView, cancel_challenge_expiry_task
 
 
 def register_admin_commands(bot: discord.Bot):
@@ -129,6 +129,7 @@ def register_admin_commands(bot: discord.Bot):
             embed.set_footer(text=f"Force-created by mod: {fmt_user(ctx.author)}")
 
             view = MatchStartView(match_id, player_one.id, player_two.id)
+            get_bot().add_view(view)
             msg = await ctx.followup.send(embed=embed, view=view, ephemeral=False, wait=True)
             if msg:
                 async with get_db_pool().acquire() as conn:
@@ -210,6 +211,7 @@ def register_admin_commands(bot: discord.Bot):
                     ephemeral=True,
                 )
 
+            cancel_challenge_expiry_task(match_id)
             embed = await build_accepted_match_embed(
                 match_id,
                 int(match["challenger_id"]),
@@ -217,11 +219,9 @@ def register_admin_commands(bot: discord.Bot):
                 match["wager_amount"],
                 accepted_by_text=f"Force-accepted by mod: {fmt_user(ctx.author)}",
             )
-            await update_match_message(
-                match_id,
-                embed,
-                view=MatchStartView(match_id, int(match["challenger_id"]), int(match["opponent_id"])),
-            )
+            start_view = MatchStartView(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
+            get_bot().add_view(start_view)
+            await update_match_message(match_id, embed, view=start_view)
 
             await ctx.followup.send(f"Match `{match_id}` has been force-accepted.", ephemeral=True)
             await log(
@@ -280,6 +280,7 @@ def register_admin_commands(bot: discord.Bot):
                     ephemeral=True,
                 )
 
+            cancel_challenge_expiry_task(match_id)
             embed = await build_cancelled_match_embed(
                 f"A moderator cancelled this challenge. {challenger_user.mention}'s wager has been refunded."
             )

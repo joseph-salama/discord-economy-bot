@@ -33,7 +33,14 @@ from bot_helpers import (
     spendable,
     update_match_message,
 )
-from bot_views import ChallengeView, MatchReportView, MatchStartView, TopLeaderboardView
+from bot_views import (
+    ChallengeView,
+    MatchReportView,
+    MatchStartView,
+    TopLeaderboardView,
+    cancel_challenge_expiry_task,
+    schedule_challenge_expiry,
+)
 
 
 def register_commands(bot: discord.Bot):
@@ -169,6 +176,8 @@ def register_commands(bot: discord.Bot):
             embed.set_footer(text=f"Challenge expires in {CHALLENGE_TIMEOUT_SECONDS // 60} minutes")
 
             view = ChallengeView(match_id, ctx.author.id, opponent.id)
+            get_bot().add_view(view)
+            schedule_challenge_expiry(match_id)
             msg = await ctx.followup.send(embed=embed, view=view, wait=True)
             if msg:
                 async with get_db_pool().acquire() as conn:
@@ -231,11 +240,9 @@ def register_commands(bot: discord.Bot):
                 value="One of the two players can press the winner button on the match message below when the match is over.",
                 inline=False,
             )
-            await update_match_message(
-                match_id,
-                embed,
-                view=MatchReportView(match_id, int(match["challenger_id"]), int(match["opponent_id"])),
-            )
+            report_view = MatchReportView(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
+            get_bot().add_view(report_view)
+            await update_match_message(match_id, embed, view=report_view)
             await ctx.respond(embed=embed)
             await log(f"🥊 MATCH STARTED — Match ID: {match_id} | Started by: {fmt_user(ctx.author)}")
 
@@ -549,6 +556,7 @@ def register_commands(bot: discord.Bot):
             view.page = max(1, min(page, view.total_pages))
             await view.refresh_buttons()
             await ctx.respond(embed=embed, view=view)
+            view.message = await ctx.interaction.original_response()
         except Exception:
             await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /top | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
@@ -593,6 +601,8 @@ def register_commands(bot: discord.Bot):
                     "Could not refund this battle cleanly. Please ask a moderator for help.",
                     ephemeral=True,
                 )
+
+            cancel_challenge_expiry_task(match_id)
 
             channel = get_bot().get_channel(int(match["channel_id"]))
             if channel and match["message_id"]:
