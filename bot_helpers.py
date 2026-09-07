@@ -171,6 +171,57 @@ async def release_escrow(conn, user_id: int, amount: int, reason: str, user_tag:
     await log(f"🔓 ESCROW RELEASED — {user_tag or user_id} refunded {fmt(amount)} ({reason})")
 
 
+async def release_escrow_up_to(conn, user_id: int, amount: int, reason: str, user_tag: str = "") -> int:
+    """
+    Release up to `amount` from escrow without failing if escrow is short.
+    Used by admin clear/cancel flows so inconsistent escrow can't block cleanup.
+    Returns the amount actually released.
+    """
+    if amount <= 0:
+        return 0
+
+    row = await lock_user(conn, user_id)
+    if not row:
+        await log(
+            f"⚠️ ESCROW RELEASE SKIPPED — {user_tag or user_id} not found ({reason}; wanted {fmt(amount)})"
+        )
+        return 0
+
+    available = max(0, row["escrow"])
+    to_release = min(amount, available)
+    if to_release <= 0:
+        await log(
+            f"⚠️ ESCROW RELEASE SKIPPED — {user_tag or user_id} had {fmt(0)} escrow "
+            f"({reason}; wanted {fmt(amount)})"
+        )
+        return 0
+
+    updated = await conn.fetchrow(
+        """
+        UPDATE users
+        SET escrow = escrow - $1
+        WHERE user_id = $2 AND escrow >= $1
+        RETURNING balance, escrow
+        """,
+        to_release,
+        str(user_id),
+    )
+    if not updated:
+        await log(
+            f"⚠️ ESCROW RELEASE SKIPPED — {user_tag or user_id} escrow changed concurrently "
+            f"({reason}; wanted {fmt(amount)})"
+        )
+        return 0
+
+    note = ""
+    if to_release < amount:
+        note = f" (only {fmt(to_release)} available; wanted {fmt(amount)})"
+    await log(
+        f"🔓 ESCROW RELEASED — {user_tag or user_id} refunded {fmt(to_release)} ({reason}){note}"
+    )
+    return to_release
+
+
 async def burn_escrow(conn, user_id: int, amount: int, reason: str, user_tag: str = ""):
     row = await conn.fetchrow(
         """
@@ -655,6 +706,7 @@ async def cancel_open_match_with_refunds(conn, match) -> tuple[int, int]:
     """
     Cancel one PENDING/ACCEPTED/ACTIVE match and refund escrows + pending bets.
     Returns (player_refunds, bet_refunds).
+    Uses release_escrow_up_to so short/inconsistent escrow cannot abort the clear.
     """
     match_id = match["match_id"]
     status = match["status"]
@@ -678,31 +730,32 @@ async def cancel_open_match_with_refunds(conn, match) -> tuple[int, int]:
     challenger = await get_bot().fetch_user(challenger_id)
 
     if status == "PENDING":
-        await release_escrow(
+        released = await release_escrow_up_to(
             conn,
             challenger_id,
             wager,
             f"open matches cleared (match {match_id})",
             fmt_user(challenger),
         )
-        player_refunds = 1
+        if released > 0:
+            player_refunds = 1
     else:
         opponent = await get_bot().fetch_user(opponent_id)
-        await release_escrow(
+        released_challenger = await release_escrow_up_to(
             conn,
             challenger_id,
             wager,
             f"open matches cleared (match {match_id})",
             fmt_user(challenger),
         )
-        await release_escrow(
+        released_opponent = await release_escrow_up_to(
             conn,
             opponent_id,
             wager,
             f"open matches cleared (match {match_id})",
             fmt_user(opponent),
         )
-        player_refunds = 2
+        player_refunds = int(released_challenger > 0) + int(released_opponent > 0)
 
     bets = await conn.fetch(
         """
@@ -715,7 +768,7 @@ async def cancel_open_match_with_refunds(conn, match) -> tuple[int, int]:
     bet_refunds = 0
     for bet in bets:
         bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
-        await release_escrow(
+        released = await release_escrow_up_to(
             conn,
             int(bet["bettor_id"]),
             bet["amount"],
@@ -723,6 +776,7 @@ async def cancel_open_match_with_refunds(conn, match) -> tuple[int, int]:
             fmt_user(bettor),
         )
         await conn.execute("DELETE FROM bets WHERE bet_id = $1", bet["bet_id"])
-        bet_refunds += 1
+        if released > 0:
+            bet_refunds += 1
 
     return player_refunds, bet_refunds
