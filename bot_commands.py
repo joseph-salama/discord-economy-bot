@@ -9,7 +9,10 @@ from bot_helpers import (
     CURRENCY_NAME,
     DAILY_AMOUNT,
     MIN_BATTLE_WAGER,
+    InsufficientFundsError,
     build_top_embed,
+    cancel_match_if_pending,
+    complete_match_if_active,
     debit_escrow,
     enforce_channel,
     ensure_user,
@@ -21,6 +24,8 @@ from bot_helpers import (
     get_db_pool,
     get_user,
     has_mod_role,
+    lock_match,
+    lock_user,
     log,
     now_utc,
     release_escrow,
@@ -93,48 +98,66 @@ def register_commands(bot: discord.Bot):
 
             await ctx.defer()
 
-            async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                await ensure_user(conn, opponent.id)
-                challenger_row = await get_user(conn, ctx.author.id)
-                opponent_row = await get_user(conn, opponent.id)
+            try:
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        await ensure_user(conn, ctx.author.id)
+                        await ensure_user(conn, opponent.id)
+                        challenger_row = await lock_user(conn, ctx.author.id)
+                        opponent_row = await lock_user(conn, opponent.id)
+                        if not challenger_row or not opponent_row:
+                            return await ctx.followup.send(
+                                "Could not load balances. Please try again.",
+                                ephemeral=True,
+                            )
 
-                existing_match = await find_open_match_between(conn, ctx.author.id, opponent.id)
-                if existing_match:
-                    return await ctx.followup.send(
-                        f"You already have an open battle with {opponent.mention} (match `{existing_match['match_id']}`, status: {existing_match['status']}). "
-                        "You can start battles with other people, but only one unresolved battle is allowed per pair until it is completed, declined, cancelled, or times out.",
-                        ephemeral=True,
-                    )
+                        existing_match = await find_open_match_between(conn, ctx.author.id, opponent.id)
+                        if existing_match:
+                            return await ctx.followup.send(
+                                f"You already have an open battle with {opponent.mention} (match `{existing_match['match_id']}`, status: {existing_match['status']}). "
+                                "You can start battles with other people, but only one unresolved battle is allowed per pair until it is completed, declined, cancelled, or times out.",
+                                ephemeral=True,
+                            )
 
-                challenger_available = spendable(challenger_row)
-                if challenger_available < amount:
-                    return await ctx.followup.send(
-                        f"You have insufficient funds. You need {fmt(amount)} but only have {fmt(challenger_available)} available.",
-                        ephemeral=True,
-                    )
-                if spendable(opponent_row) < amount:
-                    return await ctx.followup.send(
-                        f"{opponent.display_name} doesn't have enough {CURRENCY_NAME} to match that wager.",
-                        ephemeral=True,
-                    )
+                        challenger_available = spendable(challenger_row)
+                        if challenger_available < amount:
+                            return await ctx.followup.send(
+                                f"You have insufficient funds. You need {fmt(amount)} but only have {fmt(challenger_available)} available.",
+                                ephemeral=True,
+                            )
+                        if spendable(opponent_row) < amount:
+                            return await ctx.followup.send(
+                                f"{opponent.display_name} doesn't have enough {CURRENCY_NAME} to match that wager.",
+                                ephemeral=True,
+                            )
 
-                match_id = gen_id()
-                while await conn.fetchrow("SELECT 1 FROM matches WHERE match_id = $1", match_id):
-                    match_id = gen_id()
+                        match_id = gen_id()
+                        while await conn.fetchrow("SELECT 1 FROM matches WHERE match_id = $1", match_id):
+                            match_id = gen_id()
 
-                await debit_escrow(conn, ctx.author.id, amount, f"battle wager escrowed (match {match_id})", fmt_user(ctx.author))
-                await conn.execute(
-                    """
-                    INSERT INTO matches (match_id, challenger_id, opponent_id, wager_amount, status, channel_id, created_at)
-                    VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)
-                    """,
-                    match_id,
-                    str(ctx.author.id),
-                    str(opponent.id),
-                    amount,
-                    str(ctx.channel_id),
-                    now_utc(),
+                        await debit_escrow(
+                            conn,
+                            ctx.author.id,
+                            amount,
+                            f"battle wager escrowed (match {match_id})",
+                            fmt_user(ctx.author),
+                        )
+                        await conn.execute(
+                            """
+                            INSERT INTO matches (match_id, challenger_id, opponent_id, wager_amount, status, channel_id, created_at)
+                            VALUES ($1, $2, $3, $4, 'PENDING', $5, $6)
+                            """,
+                            match_id,
+                            str(ctx.author.id),
+                            str(opponent.id),
+                            amount,
+                            str(ctx.channel_id),
+                            now_utc(),
+                        )
+            except InsufficientFundsError:
+                return await ctx.followup.send(
+                    f"You have insufficient funds to create this battle for {fmt(amount)}.",
+                    ephemeral=True,
                 )
 
             embed = discord.Embed(title="⚔️ Battle Challenge!", color=discord.Color.orange())
@@ -170,22 +193,33 @@ def register_commands(bot: discord.Bot):
                 return
             match_id = match_id.upper()
             async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
-                if not match:
-                    return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
-                if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]) and not has_mod_role(ctx):
-                    return await ctx.respond("You must be one of the players or a moderator to start this match.", ephemeral=True)
-                if match["status"] != "ACCEPTED":
-                    return await ctx.respond(
-                        f"Match `{match_id}` is not in ACCEPTED status (current: {match['status']}).",
-                        ephemeral=True,
+                async with conn.transaction():
+                    await ensure_user(conn, ctx.author.id)
+                    match = await lock_match(conn, match_id)
+                    if not match:
+                        return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                    if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]) and not has_mod_role(ctx):
+                        return await ctx.respond("You must be one of the players or a moderator to start this match.", ephemeral=True)
+                    if match["status"] != "ACCEPTED":
+                        return await ctx.respond(
+                            f"Match `{match_id}` is not in ACCEPTED status (current: {match['status']}).",
+                            ephemeral=True,
+                        )
+                    started = await conn.fetchrow(
+                        """
+                        UPDATE matches
+                        SET status = 'ACTIVE', started_at = $1
+                        WHERE match_id = $2 AND status = 'ACCEPTED'
+                        RETURNING *
+                        """,
+                        now_utc(),
+                        match_id,
                     )
-                await conn.execute(
-                    "UPDATE matches SET status = 'ACTIVE', started_at = $1 WHERE match_id = $2",
-                    now_utc(),
-                    match_id,
-                )
+                    if not started:
+                        return await ctx.respond(
+                            f"Match `{match_id}` could not be started (it may have just changed status).",
+                            ephemeral=True,
+                        )
 
             embed = discord.Embed(
                 title="🥊 Match Started!",
@@ -217,37 +251,57 @@ def register_commands(bot: discord.Bot):
             if not await enforce_channel(ctx):
                 return
             match_id = match_id.upper()
-            async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
-                if not match:
-                    return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
-                if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]):
-                    return await ctx.respond("You are not a participant in this match.", ephemeral=True)
-                if match["status"] != "ACTIVE":
-                    return await ctx.respond(f"Match `{match_id}` is not ACTIVE (current: {match['status']}).", ephemeral=True)
-                if str(winner.id) not in (match["challenger_id"], match["opponent_id"]):
-                    return await ctx.respond("The winner must be one of the two players.", ephemeral=True)
+            await ctx.defer()
+            payout_embed = None
+            try:
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        await ensure_user(conn, ctx.author.id)
+                        match = await lock_match(conn, match_id)
+                        if not match:
+                            return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
+                        if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]):
+                            return await ctx.followup.send("You are not a participant in this match.", ephemeral=True)
+                        if match["status"] != "ACTIVE":
+                            return await ctx.followup.send(
+                                f"Match `{match_id}` is not ACTIVE (current: {match['status']}).",
+                                ephemeral=True,
+                            )
+                        if str(winner.id) not in (match["challenger_id"], match["opponent_id"]):
+                            return await ctx.followup.send("The winner must be one of the two players.", ephemeral=True)
 
-                await conn.execute(
-                    "UPDATE matches SET status = 'COMPLETED', winner_id = $1, reported_by_id = $2 WHERE match_id = $3",
-                    str(winner.id),
-                    str(ctx.author.id),
-                    match_id,
+                        completed = await complete_match_if_active(
+                            conn,
+                            match_id,
+                            str(winner.id),
+                            str(ctx.author.id),
+                        )
+                        if not completed:
+                            return await ctx.followup.send(
+                                f"Match `{match_id}` was already completed by someone else.",
+                                ephemeral=True,
+                            )
+                        payout_embed = await run_payout(conn, match_id, str(winner.id))
+            except InsufficientFundsError as e:
+                await log(f"❌ ERROR — /report payout failed for {match_id}: {e}")
+                return await ctx.followup.send(
+                    "Payout failed because escrowed funds were inconsistent. Please ask a moderator to use `/resolve`.",
+                    ephemeral=True,
                 )
-                await ctx.defer()
-                await run_payout(conn, match_id, str(winner.id), ctx.channel)
 
-                complete_embed = discord.Embed(
-                    title="⚔️ Match Complete!",
-                    description=f"Match `{match_id}` has finished.",
-                    color=discord.Color.gold(),
-                )
-                complete_embed.add_field(name="Winner", value=winner.mention, inline=True)
-                complete_embed.add_field(name="Status", value="**COMPLETED**", inline=True)
-                await update_match_message(match_id, complete_embed, view=None)
+            if payout_embed:
+                await ctx.channel.send(embed=payout_embed)
 
-                await ctx.followup.send(f"Match `{match_id}` has been completed!", ephemeral=True)
+            complete_embed = discord.Embed(
+                title="⚔️ Match Complete!",
+                description=f"Match `{match_id}` has finished.",
+                color=discord.Color.gold(),
+            )
+            complete_embed.add_field(name="Winner", value=winner.mention, inline=True)
+            complete_embed.add_field(name="Status", value="**COMPLETED**", inline=True)
+            await update_match_message(match_id, complete_embed, view=None)
+
+            await ctx.followup.send(f"Match `{match_id}` has been completed!", ephemeral=True)
 
         except Exception:
             if ctx.response.is_done():
@@ -269,49 +323,53 @@ def register_commands(bot: discord.Bot):
                 return await ctx.respond("Bet amount must be greater than zero.", ephemeral=True)
 
             async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
-                if not match:
-                    return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
-                if str(ctx.author.id) in (match["challenger_id"], match["opponent_id"]):
-                    return await ctx.respond("Players cannot bet on their own match.", ephemeral=True)
-                if match["status"] != "ACCEPTED":
-                    return await ctx.respond(
-                        f"Bets are only open during ACCEPTED status (current: {match['status']}).",
-                        ephemeral=True,
-                    )
-                if str(player.id) not in (match["challenger_id"], match["opponent_id"]):
-                    return await ctx.respond("You must bet on one of the two players.", ephemeral=True)
+                try:
+                    async with conn.transaction():
+                        await ensure_user(conn, ctx.author.id)
+                        match = await lock_match(conn, match_id)
+                        if not match:
+                            return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                        if str(ctx.author.id) in (match["challenger_id"], match["opponent_id"]):
+                            return await ctx.respond("Players cannot bet on their own match.", ephemeral=True)
+                        if match["status"] != "ACCEPTED":
+                            return await ctx.respond(
+                                f"Bets are only open during ACCEPTED status (current: {match['status']}).",
+                                ephemeral=True,
+                            )
+                        if str(player.id) not in (match["challenger_id"], match["opponent_id"]):
+                            return await ctx.respond("You must bet on one of the two players.", ephemeral=True)
 
-                existing = await conn.fetchrow(
-                    "SELECT 1 FROM bets WHERE match_id = $1 AND bettor_id = $2 AND status = 'PENDING'",
-                    match_id,
-                    str(ctx.author.id),
-                )
-                if existing:
-                    return await ctx.respond(
-                        "You already have an active bet on this match. Use `/cancelbet` to change it.",
-                        ephemeral=True,
-                    )
+                        existing = await conn.fetchrow(
+                            "SELECT 1 FROM bets WHERE match_id = $1 AND bettor_id = $2 AND status = 'PENDING'",
+                            match_id,
+                            str(ctx.author.id),
+                        )
+                        if existing:
+                            return await ctx.respond(
+                                "You already have an active bet on this match. Use `/cancelbet` to change it.",
+                                ephemeral=True,
+                            )
 
-                bettor_row = await get_user(conn, ctx.author.id)
-                bettor_available = spendable(bettor_row)
-                if bettor_available < amount:
-                    return await ctx.respond(f"Insufficient funds. You have {fmt(bettor_available)} available.", ephemeral=True)
+                        bettor_row = await lock_user(conn, ctx.author.id)
+                        bettor_available = spendable(bettor_row)
+                        if bettor_available < amount:
+                            return await ctx.respond(f"Insufficient funds. You have {fmt(bettor_available)} available.", ephemeral=True)
 
-                bet_id = gen_id(5)
-                while await conn.fetchrow("SELECT 1 FROM bets WHERE bet_id = $1", bet_id):
-                    bet_id = gen_id(5)
+                        bet_id = gen_id(5)
+                        while await conn.fetchrow("SELECT 1 FROM bets WHERE bet_id = $1", bet_id):
+                            bet_id = gen_id(5)
 
-                await debit_escrow(conn, ctx.author.id, amount, f"bet escrowed (match {match_id})", fmt_user(ctx.author))
-                await conn.execute(
-                    "INSERT INTO bets (bet_id, match_id, bettor_id, predicted_winner_id, amount, status) VALUES ($1, $2, $3, $4, $5, 'PENDING')",
-                    bet_id,
-                    match_id,
-                    str(ctx.author.id),
-                    str(player.id),
-                    amount,
-                )
+                        await debit_escrow(conn, ctx.author.id, amount, f"bet escrowed (match {match_id})", fmt_user(ctx.author))
+                        await conn.execute(
+                            "INSERT INTO bets (bet_id, match_id, bettor_id, predicted_winner_id, amount, status) VALUES ($1, $2, $3, $4, $5, 'PENDING')",
+                            bet_id,
+                            match_id,
+                            str(ctx.author.id),
+                            str(player.id),
+                            amount,
+                        )
+                except InsufficientFundsError:
+                    return await ctx.respond(f"Insufficient funds. You can't bet {fmt(amount)}.", ephemeral=True)
 
             embed = discord.Embed(
                 title="🎲 Bet Placed!",
@@ -342,30 +400,41 @@ def register_commands(bot: discord.Bot):
                 return await ctx.respond("You cannot give money to a bot.", ephemeral=True)
 
             async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                await ensure_user(conn, user.id)
+                async with conn.transaction():
+                    await ensure_user(conn, ctx.author.id)
+                    await ensure_user(conn, user.id)
 
-                sender_row = await get_user(conn, ctx.author.id)
-                sender_available = spendable(sender_row)
-                if sender_available < amount:
-                    return await ctx.respond(
-                        f"You only have {fmt(sender_available)} available, so you can't give {fmt(amount)}.",
-                        ephemeral=True,
+                    sender_row = await lock_user(conn, ctx.author.id)
+                    sender_available = spendable(sender_row)
+                    if sender_available < amount:
+                        return await ctx.respond(
+                            f"You only have {fmt(sender_available)} available, so you can't give {fmt(amount)}.",
+                            ephemeral=True,
+                        )
+
+                    sender_updated = await conn.fetchrow(
+                        """
+                        UPDATE users
+                        SET balance = balance - $1
+                        WHERE user_id = $2 AND balance - escrow >= $1
+                        RETURNING balance, escrow
+                        """,
+                        amount,
+                        str(ctx.author.id),
                     )
+                    if not sender_updated:
+                        return await ctx.respond(
+                            f"You only have {fmt(sender_available)} available, so you can't give {fmt(amount)}.",
+                            ephemeral=True,
+                        )
 
-                await conn.execute(
-                    "UPDATE users SET balance = balance - $1 WHERE user_id = $2",
-                    amount,
-                    str(ctx.author.id),
-                )
-                await conn.execute(
-                    "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
-                    amount,
-                    str(user.id),
-                )
-
-                sender_updated = await get_user(conn, ctx.author.id)
-                recipient_updated = await get_user(conn, user.id)
+                    await lock_user(conn, user.id)
+                    await conn.execute(
+                        "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                        amount,
+                        str(user.id),
+                    )
+                    recipient_updated = await get_user(conn, user.id)
 
             embed = discord.Embed(
                 title="💸 Transfer Complete",
@@ -420,27 +489,39 @@ def register_commands(bot: discord.Bot):
             if not await enforce_channel(ctx):
                 return
             async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                row = await get_user(conn, ctx.author.id)
-                now = now_utc()
-                if row["last_daily"]:
-                    next_claim = row["last_daily"] + timedelta(hours=24)
-                    if now < next_claim:
-                        remaining = next_claim - now
-                        hours, rem = divmod(int(remaining.total_seconds()), 3600)
-                        minutes = rem // 60
+                async with conn.transaction():
+                    await ensure_user(conn, ctx.author.id)
+                    row = await lock_user(conn, ctx.author.id)
+                    now = now_utc()
+                    if row["last_daily"]:
+                        next_claim = row["last_daily"] + timedelta(hours=24)
+                        if now < next_claim:
+                            remaining = next_claim - now
+                            hours, rem = divmod(int(remaining.total_seconds()), 3600)
+                            minutes = rem // 60
+                            return await ctx.respond(
+                                f"You already claimed your daily! Come back in **{hours}h {minutes}m**.",
+                                ephemeral=True,
+                            )
+
+                    updated = await conn.fetchrow(
+                        """
+                        UPDATE users
+                        SET balance = balance + $1, last_daily = $2
+                        WHERE user_id = $3
+                          AND (last_daily IS NULL OR last_daily <= $4)
+                        RETURNING balance
+                        """,
+                        DAILY_AMOUNT,
+                        now,
+                        str(ctx.author.id),
+                        now - timedelta(hours=24),
+                    )
+                    if not updated:
                         return await ctx.respond(
-                            f"You already claimed your daily! Come back in **{hours}h {minutes}m**.",
+                            "You already claimed your daily! Please try again in a little while.",
                             ephemeral=True,
                         )
-
-                await conn.execute(
-                    "UPDATE users SET balance = balance + $1, last_daily = $2 WHERE user_id = $3",
-                    DAILY_AMOUNT,
-                    now,
-                    str(ctx.author.id),
-                )
-                updated = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", str(ctx.author.id))
 
             embed = discord.Embed(
                 title="☀️ Daily Claimed!",
@@ -479,40 +560,52 @@ def register_commands(bot: discord.Bot):
             if not await enforce_channel(ctx):
                 return
             match_id = match_id.upper()
-            async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
-                if not match:
-                    return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
-                if match["challenger_id"] != str(ctx.author.id):
-                    return await ctx.respond("Only the challenger can cancel a battle.", ephemeral=True)
-                if match["status"] != "PENDING":
-                    return await ctx.respond(
-                        f"You can only cancel a PENDING match (current: {match['status']}).",
-                        ephemeral=True,
-                    )
+            try:
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        await ensure_user(conn, ctx.author.id)
+                        match = await lock_match(conn, match_id)
+                        if not match:
+                            return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                        if match["challenger_id"] != str(ctx.author.id):
+                            return await ctx.respond("Only the challenger can cancel a battle.", ephemeral=True)
+                        if match["status"] != "PENDING":
+                            return await ctx.respond(
+                                f"You can only cancel a PENDING match (current: {match['status']}).",
+                                ephemeral=True,
+                            )
 
-                await conn.execute("UPDATE matches SET status = 'CANCELLED' WHERE match_id = $1", match_id)
-                await release_escrow(
-                    conn,
-                    ctx.author.id,
-                    match["wager_amount"],
-                    f"battle cancelled by challenger (match {match_id})",
-                    fmt_user(ctx.author),
+                        cancelled = await cancel_match_if_pending(conn, match_id)
+                        if not cancelled:
+                            return await ctx.respond(
+                                f"Match `{match_id}` could not be cancelled (it may have just changed status).",
+                                ephemeral=True,
+                            )
+                        await release_escrow(
+                            conn,
+                            ctx.author.id,
+                            match["wager_amount"],
+                            f"battle cancelled by challenger (match {match_id})",
+                            fmt_user(ctx.author),
+                        )
+            except InsufficientFundsError:
+                return await ctx.respond(
+                    "Could not refund this battle cleanly. Please ask a moderator for help.",
+                    ephemeral=True,
                 )
 
-                channel = get_bot().get_channel(int(match["channel_id"]))
-                if channel and match["message_id"]:
-                    try:
-                        msg = await channel.fetch_message(int(match["message_id"]))
-                        embed = discord.Embed(
-                            title="❌ Battle Cancelled",
-                            description=f"{ctx.author.mention} cancelled the challenge. Wager refunded.",
-                            color=discord.Color.dark_gray(),
-                        )
-                        await msg.edit(embed=embed, view=None)
-                    except Exception:
-                        pass
+            channel = get_bot().get_channel(int(match["channel_id"]))
+            if channel and match["message_id"]:
+                try:
+                    msg = await channel.fetch_message(int(match["message_id"]))
+                    embed = discord.Embed(
+                        title="❌ Battle Cancelled",
+                        description=f"{ctx.author.mention} cancelled the challenge. Wager refunded.",
+                        color=discord.Color.dark_gray(),
+                    )
+                    await msg.edit(embed=embed, view=None)
+                except Exception:
+                    pass
 
             await ctx.respond(
                 f"Battle `{match_id}` cancelled and your wager of {fmt(match['wager_amount'])} has been refunded.",
@@ -533,33 +626,54 @@ def register_commands(bot: discord.Bot):
             if not await enforce_channel(ctx):
                 return
             match_id = match_id.upper()
-            async with get_db_pool().acquire() as conn:
-                await ensure_user(conn, ctx.author.id)
-                match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
-                if not match:
-                    return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
-                if match["status"] != "ACCEPTED":
-                    return await ctx.respond(
-                        f"Bets can only be cancelled while match is ACCEPTED (current: {match['status']}).",
-                        ephemeral=True,
-                    )
+            try:
+                async with get_db_pool().acquire() as conn:
+                    async with conn.transaction():
+                        await ensure_user(conn, ctx.author.id)
+                        match = await lock_match(conn, match_id)
+                        if not match:
+                            return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                        if match["status"] != "ACCEPTED":
+                            return await ctx.respond(
+                                f"Bets can only be cancelled while match is ACCEPTED (current: {match['status']}).",
+                                ephemeral=True,
+                            )
 
-                existing_bet = await conn.fetchrow(
-                    "SELECT * FROM bets WHERE match_id = $1 AND bettor_id = $2 AND status = 'PENDING'",
-                    match_id,
-                    str(ctx.author.id),
-                )
-                if not existing_bet:
-                    return await ctx.respond(f"You don't have an active bet on match `{match_id}`.", ephemeral=True)
+                        existing_bet = await conn.fetchrow(
+                            """
+                            SELECT * FROM bets
+                            WHERE match_id = $1 AND bettor_id = $2 AND status = 'PENDING'
+                            FOR UPDATE
+                            """,
+                            match_id,
+                            str(ctx.author.id),
+                        )
+                        if not existing_bet:
+                            return await ctx.respond(f"You don't have an active bet on match `{match_id}`.", ephemeral=True)
 
-                await release_escrow(
-                    conn,
-                    ctx.author.id,
-                    existing_bet["amount"],
-                    f"bet cancelled (match {match_id})",
-                    fmt_user(ctx.author),
+                        deleted = await conn.fetchrow(
+                            """
+                            DELETE FROM bets
+                            WHERE bet_id = $1 AND status = 'PENDING'
+                            RETURNING *
+                            """,
+                            existing_bet["bet_id"],
+                        )
+                        if not deleted:
+                            return await ctx.respond(f"You don't have an active bet on match `{match_id}`.", ephemeral=True)
+
+                        await release_escrow(
+                            conn,
+                            ctx.author.id,
+                            existing_bet["amount"],
+                            f"bet cancelled (match {match_id})",
+                            fmt_user(ctx.author),
+                        )
+            except InsufficientFundsError:
+                return await ctx.respond(
+                    "Could not refund this bet cleanly. Please ask a moderator for help.",
+                    ephemeral=True,
                 )
-                await conn.execute("DELETE FROM bets WHERE bet_id = $1", existing_bet["bet_id"])
 
             await ctx.respond(
                 f"Your bet of {fmt(existing_bet['amount'])} on match `{match_id}` has been cancelled and refunded.",

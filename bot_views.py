@@ -4,16 +4,19 @@ from bot_helpers import (
     CHALLENGE_TIMEOUT_SECONDS,
     CURRENCY_NAME,
     MODERATOR_ROLE_ID,
+    InsufficientFundsError,
     build_accepted_match_embed,
     build_top_embed,
+    cancel_match_if_pending,
+    complete_match_if_active,
     debit_escrow,
     ensure_user,
     fmt,
     fmt_user,
     get_bot,
     get_db_pool,
-    get_user,
-    has_mod_role,
+    lock_match,
+    lock_user,
     log,
     now_utc,
     release_escrow,
@@ -31,53 +34,97 @@ class ChallengeView(discord.ui.View):
         self.opponent_id = opponent_id
 
     async def on_timeout(self):
-        async with get_db_pool().acquire() as conn:
-            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
-            if not match or match["status"] != "PENDING":
-                return
-            await conn.execute("UPDATE matches SET status = 'CANCELLED' WHERE match_id = $1", self.match_id)
-            challenger = await get_bot().fetch_user(self.challenger_id)
-            await release_escrow(conn, self.challenger_id, match["wager_amount"], "battle timeout refund", fmt_user(challenger))
-            channel = get_bot().get_channel(int(match["channel_id"]))
-            if channel and match["message_id"]:
-                try:
-                    msg = await channel.fetch_message(int(match["message_id"]))
-                    embed = discord.Embed(
-                        title="⚔️ Challenge Expired",
-                        description=f"The challenge timed out. {challenger.mention}'s wager has been refunded.",
-                        color=discord.Color.dark_gray(),
+        try:
+            async with get_db_pool().acquire() as conn:
+                async with conn.transaction():
+                    match = await cancel_match_if_pending(conn, self.match_id)
+                    if not match:
+                        return
+                    challenger = await get_bot().fetch_user(self.challenger_id)
+                    await release_escrow(
+                        conn,
+                        self.challenger_id,
+                        match["wager_amount"],
+                        "battle timeout refund",
+                        fmt_user(challenger),
                     )
-                    await msg.edit(embed=embed, view=None)
-                except Exception:
-                    pass
-            await log(
-                f"⏰ BATTLE TIMEOUT — Match ID: {self.match_id} | Challenger: {fmt_user(challenger)} | Wager refunded: {fmt(match['wager_amount'])}"
-            )
+        except Exception as e:
+            await log(f"❌ ERROR — Challenge timeout for match {self.match_id}: {e}")
+            return
+
+        channel = get_bot().get_channel(int(match["channel_id"]))
+        if channel and match["message_id"]:
+            try:
+                msg = await channel.fetch_message(int(match["message_id"]))
+                embed = discord.Embed(
+                    title="⚔️ Challenge Expired",
+                    description=f"The challenge timed out. {challenger.mention}'s wager has been refunded.",
+                    color=discord.Color.dark_gray(),
+                )
+                await msg.edit(embed=embed, view=None)
+            except Exception:
+                pass
+        await log(
+            f"⏰ BATTLE TIMEOUT — Match ID: {self.match_id} | Challenger: {fmt_user(challenger)} | Wager refunded: {fmt(match['wager_amount'])}"
+        )
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, emoji="✅")
     async def accept(self, button: discord.ui.Button, interaction: discord.Interaction):
         if interaction.user.id != self.opponent_id:
             return await interaction.response.send_message("This is not your battle to accept.", ephemeral=True)
-        async with get_db_pool().acquire() as conn:
-            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
-            if not match or match["status"] != "PENDING":
-                return await interaction.response.send_message("This challenge is no longer valid.", ephemeral=True)
 
-            opponent = interaction.user
-            await ensure_user(conn, opponent.id)
-            opp_row = await get_user(conn, opponent.id)
-            avail = spendable(opp_row)
-            if avail < match["wager_amount"]:
-                return await interaction.response.send_message(
-                    f"You don't have enough {CURRENCY_NAME} to accept. You need {fmt(match['wager_amount'])} but only have {fmt(avail)} available.",
-                    ephemeral=True,
-                )
+        opponent = interaction.user
+        try:
+            async with get_db_pool().acquire() as conn:
+                async with conn.transaction():
+                    match = await lock_match(conn, self.match_id)
+                    if not match or match["status"] != "PENDING":
+                        return await interaction.response.send_message(
+                            "This challenge is no longer valid.",
+                            ephemeral=True,
+                        )
 
-            await debit_escrow(conn, opponent.id, match["wager_amount"], f"battle wager escrowed (match {self.match_id})", fmt_user(opponent))
-            await conn.execute(
-                "UPDATE matches SET status = 'ACCEPTED', accepted_at = $1 WHERE match_id = $2",
-                now_utc(),
-                self.match_id,
+                    await ensure_user(conn, opponent.id)
+                    opp_row = await lock_user(conn, opponent.id)
+                    if not opp_row:
+                        return await interaction.response.send_message(
+                            "Could not load your balance. Please try again.",
+                            ephemeral=True,
+                        )
+                    avail = spendable(opp_row)
+                    if avail < match["wager_amount"]:
+                        return await interaction.response.send_message(
+                            f"You don't have enough {CURRENCY_NAME} to accept. You need {fmt(match['wager_amount'])} but only have {fmt(avail)} available.",
+                            ephemeral=True,
+                        )
+
+                    accepted = await conn.fetchrow(
+                        """
+                        UPDATE matches
+                        SET status = 'ACCEPTED', accepted_at = $1
+                        WHERE match_id = $2 AND status = 'PENDING'
+                        RETURNING *
+                        """,
+                        now_utc(),
+                        self.match_id,
+                    )
+                    if not accepted:
+                        return await interaction.response.send_message(
+                            "This challenge is no longer valid.",
+                            ephemeral=True,
+                        )
+
+                    await debit_escrow(
+                        conn,
+                        opponent.id,
+                        match["wager_amount"],
+                        f"battle wager escrowed (match {self.match_id})",
+                        fmt_user(opponent),
+                    )
+        except InsufficientFundsError:
+            return await interaction.response.send_message(
+                f"You don't have enough {CURRENCY_NAME} to accept this challenge.",
+                ephemeral=True,
             )
 
         challenger = await get_bot().fetch_user(self.challenger_id)
@@ -100,13 +147,29 @@ class ChallengeView(discord.ui.View):
     async def decline(self, button: discord.ui.Button, interaction: discord.Interaction):
         if interaction.user.id != self.opponent_id:
             return await interaction.response.send_message("This is not your battle to decline.", ephemeral=True)
-        async with get_db_pool().acquire() as conn:
-            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
-            if not match or match["status"] != "PENDING":
-                return await interaction.response.send_message("This challenge is no longer valid.", ephemeral=True)
-            challenger = await get_bot().fetch_user(self.challenger_id)
-            await release_escrow(conn, self.challenger_id, match["wager_amount"], "battle declined refund", fmt_user(challenger))
-            await conn.execute("UPDATE matches SET status = 'CANCELLED' WHERE match_id = $1", self.match_id)
+
+        try:
+            async with get_db_pool().acquire() as conn:
+                async with conn.transaction():
+                    match = await cancel_match_if_pending(conn, self.match_id)
+                    if not match:
+                        return await interaction.response.send_message(
+                            "This challenge is no longer valid.",
+                            ephemeral=True,
+                        )
+                    challenger = await get_bot().fetch_user(self.challenger_id)
+                    await release_escrow(
+                        conn,
+                        self.challenger_id,
+                        match["wager_amount"],
+                        "battle declined refund",
+                        fmt_user(challenger),
+                    )
+        except InsufficientFundsError:
+            return await interaction.response.send_message(
+                "This challenge could not be declined cleanly. Please ask a moderator for help.",
+                ephemeral=True,
+            )
 
         embed = discord.Embed(
             title="❌ Challenge Declined",
@@ -142,20 +205,31 @@ class MatchStartView(discord.ui.View):
             )
 
         async with get_db_pool().acquire() as conn:
-            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
-            if not match:
-                return await interaction.response.send_message("This match no longer exists.", ephemeral=True)
-            if match["status"] != "ACCEPTED":
-                return await interaction.response.send_message(
-                    f"This match cannot be started right now (current: {match['status']}).",
-                    ephemeral=True,
-                )
+            async with conn.transaction():
+                match = await lock_match(conn, self.match_id)
+                if not match:
+                    return await interaction.response.send_message("This match no longer exists.", ephemeral=True)
+                if match["status"] != "ACCEPTED":
+                    return await interaction.response.send_message(
+                        f"This match cannot be started right now (current: {match['status']}).",
+                        ephemeral=True,
+                    )
 
-            await conn.execute(
-                "UPDATE matches SET status = 'ACTIVE', started_at = $1 WHERE match_id = $2",
-                now_utc(),
-                self.match_id,
-            )
+                started = await conn.fetchrow(
+                    """
+                    UPDATE matches
+                    SET status = 'ACTIVE', started_at = $1
+                    WHERE match_id = $2 AND status = 'ACCEPTED'
+                    RETURNING *
+                    """,
+                    now_utc(),
+                    self.match_id,
+                )
+                if not started:
+                    return await interaction.response.send_message(
+                        "This match cannot be started right now.",
+                        ephemeral=True,
+                    )
 
         challenger = await get_bot().fetch_user(self.challenger_id)
         opponent = await get_bot().fetch_user(self.opponent_id)
@@ -209,25 +283,42 @@ class MatchReportView(discord.ui.View):
         if interaction.user.id not in (self.challenger_id, self.opponent_id):
             return await interaction.response.send_message("Only one of the two players can report the winner.", ephemeral=True)
 
-        async with get_db_pool().acquire() as conn:
-            match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", self.match_id)
-            if not match:
-                return await interaction.response.send_message("This match no longer exists.", ephemeral=True)
-            if match["status"] != "ACTIVE":
-                return await interaction.response.send_message(
-                    f"This match is not active right now (current: {match['status']}).",
-                    ephemeral=True,
-                )
+        await interaction.response.defer()
+        payout_embed = None
+        try:
+            async with get_db_pool().acquire() as conn:
+                async with conn.transaction():
+                    match = await lock_match(conn, self.match_id)
+                    if not match:
+                        return await interaction.followup.send("This match no longer exists.", ephemeral=True)
+                    if match["status"] != "ACTIVE":
+                        return await interaction.followup.send(
+                            f"This match is not active right now (current: {match['status']}).",
+                            ephemeral=True,
+                        )
 
-            await conn.execute(
-                "UPDATE matches SET status = 'COMPLETED', winner_id = $1, reported_by_id = $2 WHERE match_id = $3",
-                str(winner_id),
-                str(interaction.user.id),
-                self.match_id,
+                    completed = await complete_match_if_active(
+                        conn,
+                        self.match_id,
+                        str(winner_id),
+                        str(interaction.user.id),
+                    )
+                    if not completed:
+                        return await interaction.followup.send(
+                            "This match was already completed by someone else.",
+                            ephemeral=True,
+                        )
+
+                    payout_embed = await run_payout(conn, self.match_id, str(winner_id))
+        except InsufficientFundsError as e:
+            await log(f"❌ ERROR — Match report payout failed for {self.match_id}: {e}")
+            return await interaction.followup.send(
+                "Payout failed because escrowed funds were inconsistent. Please ask a moderator to use `/resolve`.",
+                ephemeral=True,
             )
 
-            await interaction.response.defer()
-            await run_payout(conn, self.match_id, str(winner_id), interaction.channel)
+        if payout_embed and interaction.channel:
+            await interaction.channel.send(embed=payout_embed)
 
         winner_user = await get_bot().fetch_user(winner_id)
         challenger = await get_bot().fetch_user(self.challenger_id)

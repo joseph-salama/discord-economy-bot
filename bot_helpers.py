@@ -93,6 +93,14 @@ def spendable(record: asyncpg.Record) -> int:
     return record["balance"] - record["escrow"]
 
 
+class InsufficientFundsError(Exception):
+    """Raised when a balance/escrow mutation cannot complete safely."""
+
+
+class PayoutReverseError(Exception):
+    """Raised when a completed match payout cannot be safely reversed."""
+
+
 async def credit(conn, user_id: int, amount: int, reason: str, user_tag: str = ""):
     await conn.execute(
         "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
@@ -106,34 +114,104 @@ async def credit(conn, user_id: int, amount: int, reason: str, user_tag: str = "
 
 
 async def debit_escrow(conn, user_id: int, amount: int, reason: str, user_tag: str = ""):
-    await conn.execute(
-        "UPDATE users SET escrow = escrow + $1 WHERE user_id = $2",
+    row = await conn.fetchrow(
+        """
+        UPDATE users
+        SET escrow = escrow + $1
+        WHERE user_id = $2 AND balance - escrow >= $1
+        RETURNING balance, escrow
+        """,
         amount,
         str(user_id),
     )
-    row = await conn.fetchrow("SELECT balance, escrow FROM users WHERE user_id = $1", str(user_id))
+    if not row:
+        raise InsufficientFundsError(
+            f"Insufficient available funds to escrow {fmt(amount)} for user {user_tag or user_id}."
+        )
     await log(
         f"🔒 ESCROW HELD — {user_tag or user_id} escrowed {fmt(amount)} ({reason}) | Available: {fmt(row['balance'] - row['escrow'])}"
     )
 
 
 async def release_escrow(conn, user_id: int, amount: int, reason: str, user_tag: str = ""):
-    await conn.execute(
-        "UPDATE users SET escrow = escrow - $1 WHERE user_id = $2",
+    row = await conn.fetchrow(
+        """
+        UPDATE users
+        SET escrow = escrow - $1
+        WHERE user_id = $2 AND escrow >= $1
+        RETURNING balance, escrow
+        """,
         amount,
         str(user_id),
     )
+    if not row:
+        raise InsufficientFundsError(
+            f"Cannot release {fmt(amount)} escrow for user {user_tag or user_id}; escrow too low."
+        )
     await log(f"🔓 ESCROW RELEASED — {user_tag or user_id} refunded {fmt(amount)} ({reason})")
 
 
 async def burn_escrow(conn, user_id: int, amount: int, reason: str, user_tag: str = ""):
-    await conn.execute(
-        "UPDATE users SET balance = balance - $1, escrow = escrow - $1 WHERE user_id = $2",
+    row = await conn.fetchrow(
+        """
+        UPDATE users
+        SET balance = balance - $1, escrow = escrow - $1
+        WHERE user_id = $2 AND balance >= $1 AND escrow >= $1
+        RETURNING balance, escrow
+        """,
         amount,
         str(user_id),
     )
+    if not row:
+        raise InsufficientFundsError(
+            f"Cannot burn {fmt(amount)} escrow for user {user_tag or user_id}; funds too low."
+        )
     await log(f"🔥 ESCROW BURNED — {user_tag or user_id} lost {fmt(amount)} ({reason})")
 
+
+async def lock_match(conn, match_id: str) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        "SELECT * FROM matches WHERE match_id = $1 FOR UPDATE",
+        match_id,
+    )
+
+
+async def lock_user(conn, user_id: int) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        "SELECT * FROM users WHERE user_id = $1 FOR UPDATE",
+        str(user_id),
+    )
+
+
+async def complete_match_if_active(
+    conn,
+    match_id: str,
+    winner_id: str,
+    reported_by_id: str,
+) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        UPDATE matches
+        SET status = 'COMPLETED', winner_id = $1, reported_by_id = $2
+        WHERE match_id = $3 AND status = 'ACTIVE'
+        RETURNING *
+        """,
+        winner_id,
+        reported_by_id,
+        match_id,
+    )
+
+
+async def cancel_match_if_pending(conn, match_id: str) -> asyncpg.Record | None:
+    return await conn.fetchrow(
+        """
+        UPDATE matches
+        SET status = 'CANCELLED'
+        WHERE match_id = $1 AND status = 'PENDING'
+        RETURNING *
+        """,
+        match_id,
+    )
 
 def has_mod_role(ctx: discord.ApplicationContext) -> bool:
     if isinstance(ctx.author, discord.Member):
@@ -321,7 +399,14 @@ async def init_database(conn):
 
 
 async def restore_match_to_pre_payout(conn, match_id: str, previous_winner_id: str):
-    match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
+    match = await lock_match(conn, match_id)
+    if not match:
+        raise PayoutReverseError(f"Match `{match_id}` not found.")
+    if match["status"] != "COMPLETED":
+        raise PayoutReverseError(
+            f"Match `{match_id}` must be COMPLETED to reverse a payout (current: {match['status']})."
+        )
+
     wager = match["wager_amount"]
     challenger_id = match["challenger_id"]
     opponent_id = match["opponent_id"]
@@ -330,11 +415,41 @@ async def restore_match_to_pre_payout(conn, match_id: str, previous_winner_id: s
     previous_winner = await get_bot().fetch_user(int(previous_winner_id))
     previous_loser = await get_bot().fetch_user(int(previous_loser_id))
 
-    await conn.execute(
-        "UPDATE users SET balance = balance - $1, escrow = escrow + $1 WHERE user_id = $2",
+    winner_row = await lock_user(conn, int(previous_winner_id))
+    if not winner_row or winner_row["balance"] < wager:
+        have = winner_row["balance"] if winner_row else 0
+        raise PayoutReverseError(
+            f"Cannot reverse match `{match_id}`: {fmt_user(previous_winner)} only has {fmt(have)} "
+            f"but needs {fmt(wager)} still available to return winnings."
+        )
+
+    bets = await conn.fetch("SELECT * FROM bets WHERE match_id = $1", match_id)
+    for bet in bets:
+        if bet["status"] != "WON":
+            continue
+        bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
+        bettor_row = await lock_user(conn, int(bet["bettor_id"]))
+        if not bettor_row or bettor_row["balance"] < bet["amount"]:
+            have = bettor_row["balance"] if bettor_row else 0
+            raise PayoutReverseError(
+                f"Cannot reverse match `{match_id}`: {fmt_user(bettor)} only has {fmt(have)} "
+                f"but needs {fmt(bet['amount'])} still available to return bet winnings."
+            )
+
+    winner_updated = await conn.fetchrow(
+        """
+        UPDATE users
+        SET balance = balance - $1, escrow = escrow + $1
+        WHERE user_id = $2 AND balance >= $1
+        RETURNING user_id
+        """,
         wager,
         str(previous_winner_id),
     )
+    if not winner_updated:
+        raise PayoutReverseError(
+            f"Cannot reverse match `{match_id}`: failed to reclaim winnings from {fmt_user(previous_winner)}."
+        )
     await log(
         f"↩️ MATCH PAYOUT REVERSED — {fmt_user(previous_winner)} returned {fmt(wager)} winnings and had {fmt(wager)} re-escrowed (match {match_id})"
     )
@@ -348,15 +463,23 @@ async def restore_match_to_pre_payout(conn, match_id: str, previous_winner_id: s
         f"↩️ MATCH PAYOUT REVERSED — {fmt_user(previous_loser)} had {fmt(wager)} restored and re-escrowed (match {match_id})"
     )
 
-    bets = await conn.fetch("SELECT * FROM bets WHERE match_id = $1", match_id)
     for bet in bets:
         bettor = await get_bot().fetch_user(int(bet["bettor_id"]))
         if bet["status"] == "WON":
-            await conn.execute(
-                "UPDATE users SET balance = balance - $1, escrow = escrow + $1 WHERE user_id = $2",
+            updated = await conn.fetchrow(
+                """
+                UPDATE users
+                SET balance = balance - $1, escrow = escrow + $1
+                WHERE user_id = $2 AND balance >= $1
+                RETURNING user_id
+                """,
                 bet["amount"],
                 bet["bettor_id"],
             )
+            if not updated:
+                raise PayoutReverseError(
+                    f"Cannot reverse match `{match_id}`: failed to reclaim bet winnings from {fmt_user(bettor)}."
+                )
             await log(
                 f"↩️ BET PAYOUT REVERSED — {fmt_user(bettor)} returned {fmt(bet['amount'])} winnings and had {fmt(bet['amount'])} re-escrowed (match {match_id})"
             )
@@ -376,7 +499,7 @@ async def restore_match_to_pre_payout(conn, match_id: str, previous_winner_id: s
     )
 
 
-async def run_payout(conn, match_id: str, winner_id: str, channel: discord.abc.Messageable, mod_tag: str | None = None):
+async def run_payout(conn, match_id: str, winner_id: str, mod_tag: str | None = None) -> discord.Embed:
     match = await conn.fetchrow("SELECT * FROM matches WHERE match_id = $1", match_id)
     wager = match["wager_amount"]
     challenger_id = match["challenger_id"]
@@ -416,12 +539,12 @@ async def run_payout(conn, match_id: str, winner_id: str, channel: discord.abc.M
         embed.add_field(name="Bet Outcomes", value="\n".join(bet_lines), inline=False)
     if mod_tag:
         embed.set_footer(text=f"Force-resolved by mod: {mod_tag}")
-    await channel.send(embed=embed)
 
     await log(
         f"🏆 MATCH COMPLETED — Match ID: {match_id} | Winner: {fmt_user(winner_user)} | Loser: {fmt_user(loser_user)} | Wager: {fmt(wager)}"
         + (f" | Force-resolved by: {mod_tag}" if mod_tag else "")
     )
+    return embed
 
 
 def parse_team_mentions(content: str) -> list[int]:
@@ -461,28 +584,29 @@ async def reward_queue_match(message: discord.Message):
         return
 
     async with get_db_pool().acquire() as conn:
-        already = await conn.fetchrow(
-            "SELECT 1 FROM rewarded_queue_messages WHERE message_id = $1",
-            str(message.id),
-        )
-        if already:
-            return
+        async with conn.transaction():
+            inserted = await conn.fetchrow(
+                """
+                INSERT INTO rewarded_queue_messages (message_id, rewarded_at)
+                VALUES ($1, $2)
+                ON CONFLICT (message_id) DO NOTHING
+                RETURNING message_id
+                """,
+                str(message.id),
+                now_utc(),
+            )
+            if not inserted:
+                return
 
-        await conn.execute(
-            "INSERT INTO rewarded_queue_messages (message_id, rewarded_at) VALUES ($1, $2)",
-            str(message.id),
-            now_utc(),
-        )
-
-        rewarded_tags = []
-        for uid in player_ids:
-            await ensure_user(conn, uid)
-            await credit(conn, uid, MATCH_REWARD, f"queue match reward (msg {message.id})")
-            try:
-                user = await get_bot().fetch_user(uid)
-                rewarded_tags.append(fmt_user(user))
-            except Exception:
-                rewarded_tags.append(str(uid))
+            rewarded_tags = []
+            for uid in player_ids:
+                await ensure_user(conn, uid)
+                await credit(conn, uid, MATCH_REWARD, f"queue match reward (msg {message.id})")
+                try:
+                    user = await get_bot().fetch_user(uid)
+                    rewarded_tags.append(fmt_user(user))
+                except Exception:
+                    rewarded_tags.append(str(uid))
 
     await log(
         f"🎮 QUEUE MATCH REWARD — {fmt(MATCH_REWARD)} granted to {len(player_ids)} players in #{message.channel.name}: {', '.join(rewarded_tags)}"
