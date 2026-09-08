@@ -43,7 +43,11 @@ from bot_views import (
     MatchReportView,
     MatchStartView,
     TopLeaderboardView,
+    cancel_accepted_expiry_task,
+    cancel_all_player_match_expiry_tasks,
     cancel_challenge_expiry_task,
+    schedule_active_expiry,
+    schedule_accepted_expiry,
     schedule_challenge_expiry,
 )
 
@@ -249,17 +253,21 @@ def register_commands(bot: discord.Bot):
         try:
             if not await enforce_channel(ctx):
                 return
+            await ctx.defer()
             match_id = match_id.upper()
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     await ensure_user(conn, ctx.author.id)
                     match = await lock_match(conn, match_id)
                     if not match:
-                        return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                        return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
                     if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]) and not has_mod_role(ctx):
-                        return await ctx.respond("You must be one of the players or a moderator to start this match.", ephemeral=True)
+                        return await ctx.followup.send(
+                            "You must be one of the players or a moderator to start this match.",
+                            ephemeral=True,
+                        )
                     if match["status"] != "ACCEPTED":
-                        return await ctx.respond(
+                        return await ctx.followup.send(
                             f"Match `{match_id}` is not in ACCEPTED status (current: {match['status']}).",
                             ephemeral=True,
                         )
@@ -274,11 +282,13 @@ def register_commands(bot: discord.Bot):
                         match_id,
                     )
                     if not started:
-                        return await ctx.respond(
+                        return await ctx.followup.send(
                             f"Match `{match_id}` could not be started (it may have just changed status).",
                             ephemeral=True,
                         )
 
+            cancel_accepted_expiry_task(match_id)
+            schedule_active_expiry(match_id)
             embed = discord.Embed(
                 title="🥊 Match Started!",
                 description=f"Match `{match_id}` is now **ACTIVE**. Bets are locked.",
@@ -292,11 +302,14 @@ def register_commands(bot: discord.Bot):
             report_view = await MatchReportView.create(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
             get_bot().add_view(report_view)
             await update_match_message(match_id, embed, view=report_view)
-            await ctx.respond(embed=embed)
+            await ctx.followup.send(embed=embed)
             await log(f"🥊 MATCH STARTED — Match ID: {match_id} | Started by: {fmt_user(ctx.author)}")
 
         except Exception:
-            await ctx.respond("Something went wrong.", ephemeral=True)
+            if ctx.response.is_done():
+                await ctx.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /start | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
     @bot.slash_command(description="Propose or confirm the winner of your match (both players must agree)")
@@ -404,6 +417,7 @@ def register_commands(bot: discord.Bot):
             if payout_embed:
                 await ctx.channel.send(embed=payout_embed)
 
+            cancel_all_player_match_expiry_tasks(match_id)
             complete_embed = discord.Embed(
                 title="⚔️ Match Complete!",
                 description=f"Match `{match_id}` has finished.",
@@ -434,22 +448,23 @@ def register_commands(bot: discord.Bot):
             if amount <= 0:
                 return await ctx.respond("Bet amount must be greater than zero.", ephemeral=True)
 
+            await ctx.defer(ephemeral=True)
             async with get_db_pool().acquire() as conn:
                 try:
                     async with conn.transaction():
                         await ensure_user(conn, ctx.author.id)
                         match = await lock_match(conn, match_id)
                         if not match:
-                            return await ctx.respond(f"Match `{match_id}` not found.", ephemeral=True)
+                            return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
                         if str(ctx.author.id) in (match["challenger_id"], match["opponent_id"]):
-                            return await ctx.respond("Players cannot bet on their own match.", ephemeral=True)
+                            return await ctx.followup.send("Players cannot bet on their own match.", ephemeral=True)
                         if match["status"] != "ACCEPTED":
-                            return await ctx.respond(
+                            return await ctx.followup.send(
                                 f"Bets are only open during ACCEPTED status (current: {match['status']}).",
                                 ephemeral=True,
                             )
                         if str(player.id) not in (match["challenger_id"], match["opponent_id"]):
-                            return await ctx.respond("You must bet on one of the two players.", ephemeral=True)
+                            return await ctx.followup.send("You must bet on one of the two players.", ephemeral=True)
 
                         existing = await conn.fetchrow(
                             "SELECT 1 FROM bets WHERE match_id = $1 AND bettor_id = $2 AND status = 'PENDING'",
@@ -457,7 +472,7 @@ def register_commands(bot: discord.Bot):
                             str(ctx.author.id),
                         )
                         if existing:
-                            return await ctx.respond(
+                            return await ctx.followup.send(
                                 "You already have an active bet on this match. Use `/cancelbet` to change it.",
                                 ephemeral=True,
                             )
@@ -465,7 +480,10 @@ def register_commands(bot: discord.Bot):
                         bettor_row = await lock_user(conn, ctx.author.id)
                         bettor_available = spendable(bettor_row)
                         if bettor_available < amount:
-                            return await ctx.respond(f"Insufficient funds. You have {fmt(bettor_available)} available.", ephemeral=True)
+                            return await ctx.followup.send(
+                                f"Insufficient funds. You have {fmt(bettor_available)} available.",
+                                ephemeral=True,
+                            )
 
                         bet_id = gen_id(5)
                         while await conn.fetchrow("SELECT 1 FROM bets WHERE bet_id = $1", bet_id):
@@ -481,25 +499,28 @@ def register_commands(bot: discord.Bot):
                             amount,
                         )
                 except asyncpg.UniqueViolationError:
-                    return await ctx.respond(
+                    return await ctx.followup.send(
                         "You already have an active bet on this match. Use `/cancelbet` to change it.",
                         ephemeral=True,
                     )
                 except InsufficientFundsError:
-                    return await ctx.respond(f"Insufficient funds. You can't bet {fmt(amount)}.", ephemeral=True)
+                    return await ctx.followup.send(f"Insufficient funds. You can't bet {fmt(amount)}.", ephemeral=True)
 
             embed = discord.Embed(
                 title="🎲 Bet Placed!",
                 description=f"{ctx.author.mention} bet {fmt(amount)} on {player.mention} in match `{match_id}`",
                 color=discord.Color.purple(),
             )
-            await ctx.respond(embed=embed)
+            await ctx.followup.send(embed=embed)
             await log(
                 f"🎲 BET PLACED — {fmt_user(ctx.author)} bet {fmt(amount)} on {fmt_user(player)} | Match: {match_id} | Bet ID: {bet_id}"
             )
 
         except Exception:
-            await ctx.respond("Something went wrong.", ephemeral=True)
+            if ctx.response.is_done():
+                await ctx.followup.send("Something went wrong.", ephemeral=True)
+            else:
+                await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /bet | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
     @bot.slash_command(description=f"Give some of your {CURRENCY_NAME} to another user")
@@ -727,7 +748,7 @@ def register_commands(bot: discord.Bot):
                     ephemeral=True,
                 )
 
-            cancel_challenge_expiry_task(match_id)
+            cancel_all_player_match_expiry_tasks(match_id)
 
             channel = get_bot().get_channel(int(match["channel_id"]))
             if channel and match["message_id"]:

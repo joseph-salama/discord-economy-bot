@@ -1,3 +1,4 @@
+import asyncio
 import random
 import string
 from datetime import datetime, timezone
@@ -54,13 +55,23 @@ def ts() -> str:
     return now_utc().strftime("%Y-%m-%d %H:%M:%S")
 
 
-async def log(message: str):
+async def _send_log_message(message: str):
     try:
         channel = get_bot().get_channel(LOG_CHANNEL_ID)
         if channel:
             await channel.send(f"`[{ts()}]` {message}")
     except Exception as e:
         print(f"Failed to log message: {e}\nMessage was: {message}")
+
+
+async def log(message: str):
+    """Fire-and-forget Discord log so money transactions never wait on channel I/O."""
+    print(f"[{ts()}] {message}")
+    try:
+        asyncio.get_running_loop().create_task(_send_log_message(message))
+    except RuntimeError:
+        # No running loop (rare); best-effort sync fallback
+        await _send_log_message(message)
 
 
 async def ensure_user(conn, user_id: int):

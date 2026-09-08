@@ -44,9 +44,15 @@ from bot_helpers import (
     update_match_message,
     update_team_match_message,
 )
-from bot_views import MatchStartView, cancel_challenge_expiry_task
+from bot_views import (
+    MatchStartView,
+    cancel_all_player_match_expiry_tasks,
+    cancel_challenge_expiry_task,
+    schedule_accepted_expiry,
+)
 from bot_team_matches import (
     TeamMatchOpenView,
+    cancel_all_team_match_expiry_tasks,
     cancel_team_match_expiry_task,
     schedule_team_match_expiry,
 )
@@ -152,6 +158,7 @@ def register_admin_commands(bot: discord.Bot):
 
             view = MatchStartView(match_id, player_one.id, player_two.id)
             get_bot().add_view(view)
+            schedule_accepted_expiry(match_id)
             try:
                 msg = await ctx.followup.send(embed=embed, view=view, ephemeral=False, wait=True)
                 if not msg:
@@ -199,6 +206,7 @@ def register_admin_commands(bot: discord.Bot):
                         "Could not post the battle message, so the forced battle was cancelled and wagers were refunded.",
                         ephemeral=True,
                     )
+                    cancel_all_player_match_expiry_tasks(match_id)
                     return
                 raise
 
@@ -279,6 +287,7 @@ def register_admin_commands(bot: discord.Bot):
                 )
 
             cancel_challenge_expiry_task(match_id)
+            schedule_accepted_expiry(match_id)
             embed = await build_accepted_match_embed(
                 match_id,
                 int(match["challenger_id"]),
@@ -347,7 +356,7 @@ def register_admin_commands(bot: discord.Bot):
                     ephemeral=True,
                 )
 
-            cancel_challenge_expiry_task(match_id)
+            cancel_all_player_match_expiry_tasks(match_id)
             embed = await build_cancelled_match_embed(
                 f"A moderator cancelled this challenge. {challenger_user.mention}'s wager has been refunded."
             )
@@ -548,6 +557,7 @@ def register_admin_commands(bot: discord.Bot):
             if payout_embed:
                 await ctx.channel.send(embed=payout_embed)
 
+            cancel_all_player_match_expiry_tasks(match_id)
             resolve_embed = discord.Embed(
                 title="⚔️ Match Complete!",
                 description=f"Match `{match_id}` was force-resolved by a moderator.",
@@ -633,11 +643,11 @@ def register_admin_commands(bot: discord.Bot):
                 f"A moderator cleared all open matches. Player wagers and spectator bets have been refunded."
             )
             for match in cancelled_matches:
-                cancel_challenge_expiry_task(match["match_id"])
+                cancel_all_player_match_expiry_tasks(match["match_id"])
                 await update_match_message(match["match_id"], embed, view=None)
 
             for team_match in cancelled_team_matches:
-                cancel_team_match_expiry_task(team_match["match_id"])
+                cancel_all_team_match_expiry_tasks(team_match["match_id"])
                 cleared_embed = discord.Embed(
                     title="🏟️ Team Match — Cancelled",
                     description="A moderator cleared all open matches. Pending bets were refunded.",
@@ -815,7 +825,7 @@ def register_admin_commands(bot: discord.Bot):
                     ephemeral=True,
                 )
 
-            cancel_team_match_expiry_task(match_id)
+            cancel_all_team_match_expiry_tasks(match_id)
             embed = await build_team_match_embed(
                 match_id,
                 role_one_id,
@@ -925,7 +935,7 @@ def register_admin_commands(bot: discord.Bot):
                     ephemeral=True,
                 )
 
-            cancel_team_match_expiry_task(match_id)
+            cancel_all_team_match_expiry_tasks(match_id)
             if payout_embed:
                 await ctx.channel.send(embed=payout_embed)
 

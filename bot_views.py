@@ -6,11 +6,15 @@ import discord
 from bot_helpers import (
     CHALLENGE_TIMEOUT_SECONDS,
     CURRENCY_NAME,
+    MATCH_ACCEPTED_TIMEOUT_SECONDS,
+    MATCH_ACTIVE_TIMEOUT_SECONDS,
     MODERATOR_ROLE_ID,
     InsufficientFundsError,
     build_accepted_match_embed,
+    build_cancelled_match_embed,
     build_top_embed,
     cancel_match_if_pending,
+    cancel_open_match_with_refunds,
     debit_escrow,
     ensure_user,
     fmt,
@@ -33,6 +37,15 @@ from bot_helpers import (
 
 # match_id -> expiry task, so we can cancel if accepted/declined early
 _challenge_expiry_tasks: dict[str, asyncio.Task] = {}
+_accepted_expiry_tasks: dict[str, asyncio.Task] = {}
+_active_expiry_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _reply(interaction: discord.Interaction, content: str, *, ephemeral: bool = True):
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(content, ephemeral=ephemeral)
 
 
 async def _edit_or_fallback(
@@ -62,6 +75,24 @@ def cancel_challenge_expiry_task(match_id: str):
     task = _challenge_expiry_tasks.pop(match_id, None)
     if task and not task.done():
         task.cancel()
+
+
+def cancel_accepted_expiry_task(match_id: str):
+    task = _accepted_expiry_tasks.pop(match_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def cancel_active_expiry_task(match_id: str):
+    task = _active_expiry_tasks.pop(match_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def cancel_all_player_match_expiry_tasks(match_id: str):
+    cancel_challenge_expiry_task(match_id)
+    cancel_accepted_expiry_task(match_id)
+    cancel_active_expiry_task(match_id)
 
 
 async def expire_pending_challenge(match_id: str) -> bool:
@@ -142,6 +173,109 @@ async def expire_stale_challenges():
         await expire_pending_challenge(row["match_id"])
 
 
+async def expire_open_player_match(match_id: str, *, expected_status: str, reason: str) -> bool:
+    """Cancel an ACCEPTED/ACTIVE match and refund wagers/bets after timeout."""
+    cancel_accepted_expiry_task(match_id)
+    cancel_active_expiry_task(match_id)
+    try:
+        async with get_db_pool().acquire() as conn:
+            async with conn.transaction():
+                match = await lock_match(conn, match_id)
+                if not match or match["status"] != expected_status:
+                    return False
+                await cancel_open_match_with_refunds(conn, match)
+    except Exception as e:
+        await log(f"❌ ERROR — {reason} for match {match_id}: {e}")
+        return False
+
+    embed = await build_cancelled_match_embed(
+        f"This match timed out ({reason}). Player wagers and spectator bets have been refunded."
+    )
+    await update_match_message(match_id, embed, view=None)
+    await log(f"⏰ MATCH TIMEOUT — Match ID: {match_id} | Status was: {expected_status} | {reason}")
+    return True
+
+
+def schedule_accepted_expiry(match_id: str, delay_seconds: float | None = None):
+    cancel_accepted_expiry_task(match_id)
+    delay = MATCH_ACCEPTED_TIMEOUT_SECONDS if delay_seconds is None else max(0.0, delay_seconds)
+
+    async def _runner():
+        try:
+            await asyncio.sleep(delay)
+            await expire_open_player_match(
+                match_id,
+                expected_status="ACCEPTED",
+                reason="accepted match idle too long",
+            )
+        except asyncio.CancelledError:
+            return
+        finally:
+            _accepted_expiry_tasks.pop(match_id, None)
+
+    _accepted_expiry_tasks[match_id] = asyncio.create_task(_runner())
+
+
+def schedule_active_expiry(match_id: str, delay_seconds: float | None = None):
+    cancel_active_expiry_task(match_id)
+    delay = MATCH_ACTIVE_TIMEOUT_SECONDS if delay_seconds is None else max(0.0, delay_seconds)
+
+    async def _runner():
+        try:
+            await asyncio.sleep(delay)
+            await expire_open_player_match(
+                match_id,
+                expected_status="ACTIVE",
+                reason="active match / report wait idle too long",
+            )
+        except asyncio.CancelledError:
+            return
+        finally:
+            _active_expiry_tasks.pop(match_id, None)
+
+    _active_expiry_tasks[match_id] = asyncio.create_task(_runner())
+
+
+async def expire_stale_accepted_matches():
+    cutoff = now_utc() - timedelta(seconds=MATCH_ACCEPTED_TIMEOUT_SECONDS)
+    async with get_db_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT match_id
+            FROM matches
+            WHERE status = 'ACCEPTED'
+              AND COALESCE(accepted_at, created_at) <= $1
+            """,
+            cutoff,
+        )
+    for row in rows:
+        await expire_open_player_match(
+            row["match_id"],
+            expected_status="ACCEPTED",
+            reason="accepted match idle too long",
+        )
+
+
+async def expire_stale_active_matches():
+    cutoff = now_utc() - timedelta(seconds=MATCH_ACTIVE_TIMEOUT_SECONDS)
+    async with get_db_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT match_id
+            FROM matches
+            WHERE status = 'ACTIVE'
+              AND COALESCE(started_at, accepted_at, created_at) <= $1
+            """,
+            cutoff,
+        )
+    for row in rows:
+        await expire_open_player_match(
+            row["match_id"],
+            expected_status="ACTIVE",
+            reason="active match / report wait idle too long",
+        )
+
+
 async def restore_persistent_views():
     """Re-register match button views after a restart so Start/Report/Accept still work."""
     bot = get_bot()
@@ -167,22 +301,44 @@ async def restore_persistent_views():
             schedule_challenge_expiry(match_id, remaining)
 
     for match in accepted:
+        match_id = match["match_id"]
         bot.add_view(
             MatchStartView(
-                match["match_id"],
+                match_id,
                 int(match["challenger_id"]),
                 int(match["opponent_id"]),
             )
         )
+        anchor = match["accepted_at"] or match["created_at"]
+        remaining = MATCH_ACCEPTED_TIMEOUT_SECONDS - (now - anchor).total_seconds()
+        if remaining <= 0:
+            await expire_open_player_match(
+                match_id,
+                expected_status="ACCEPTED",
+                reason="accepted match idle too long",
+            )
+        else:
+            schedule_accepted_expiry(match_id, remaining)
 
     for match in active:
+        match_id = match["match_id"]
         bot.add_view(
             await MatchReportView.create(
-                match["match_id"],
+                match_id,
                 int(match["challenger_id"]),
                 int(match["opponent_id"]),
             )
         )
+        anchor = match["started_at"] or match["accepted_at"] or match["created_at"]
+        remaining = MATCH_ACTIVE_TIMEOUT_SECONDS - (now - anchor).total_seconds()
+        if remaining <= 0:
+            await expire_open_player_match(
+                match_id,
+                expected_status="ACTIVE",
+                reason="active match / report wait idle too long",
+            )
+        else:
+            schedule_active_expiry(match_id, remaining)
 
     await log(
         f"🔁 RESTORED VIEWS — Pending: {len(pending)} | Accepted: {len(accepted)} | Active: {len(active)}"
@@ -219,29 +375,24 @@ class ChallengeView(discord.ui.View):
         if interaction.user.id != self.opponent_id:
             return await interaction.response.send_message("This is not your battle to accept.", ephemeral=True)
 
+        await interaction.response.defer()
         opponent = interaction.user
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     match = await lock_match(conn, self.match_id)
                     if not match or match["status"] != "PENDING":
-                        return await interaction.response.send_message(
-                            "This challenge is no longer valid.",
-                            ephemeral=True,
-                        )
+                        return await _reply(interaction, "This challenge is no longer valid.")
 
                     await ensure_user(conn, opponent.id)
                     opp_row = await lock_user(conn, opponent.id)
                     if not opp_row:
-                        return await interaction.response.send_message(
-                            "Could not load your balance. Please try again.",
-                            ephemeral=True,
-                        )
+                        return await _reply(interaction, "Could not load your balance. Please try again.")
                     avail = spendable(opp_row)
                     if avail < match["wager_amount"]:
-                        return await interaction.response.send_message(
+                        return await _reply(
+                            interaction,
                             f"You don't have enough {CURRENCY_NAME} to accept. You need {fmt(match['wager_amount'])} but only have {fmt(avail)} available.",
-                            ephemeral=True,
                         )
 
                     accepted = await conn.fetchrow(
@@ -255,10 +406,7 @@ class ChallengeView(discord.ui.View):
                         self.match_id,
                     )
                     if not accepted:
-                        return await interaction.response.send_message(
-                            "This challenge is no longer valid.",
-                            ephemeral=True,
-                        )
+                        return await _reply(interaction, "This challenge is no longer valid.")
 
                     await debit_escrow(
                         conn,
@@ -268,12 +416,13 @@ class ChallengeView(discord.ui.View):
                         fmt_user(opponent),
                     )
         except InsufficientFundsError:
-            return await interaction.response.send_message(
+            return await _reply(
+                interaction,
                 f"You don't have enough {CURRENCY_NAME} to accept this challenge.",
-                ephemeral=True,
             )
 
         cancel_challenge_expiry_task(self.match_id)
+        schedule_accepted_expiry(self.match_id)
         challenger = await get_bot().fetch_user(self.challenger_id)
         embed = await build_accepted_match_embed(
             self.match_id,
@@ -298,15 +447,13 @@ class ChallengeView(discord.ui.View):
         if interaction.user.id != self.opponent_id:
             return await interaction.response.send_message("This is not your battle to decline.", ephemeral=True)
 
+        await interaction.response.defer()
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     match = await cancel_match_if_pending(conn, self.match_id)
                     if not match:
-                        return await interaction.response.send_message(
-                            "This challenge is no longer valid.",
-                            ephemeral=True,
-                        )
+                        return await _reply(interaction, "This challenge is no longer valid.")
                     challenger = await get_bot().fetch_user(self.challenger_id)
                     await release_escrow(
                         conn,
@@ -316,9 +463,9 @@ class ChallengeView(discord.ui.View):
                         fmt_user(challenger),
                     )
         except InsufficientFundsError:
-            return await interaction.response.send_message(
+            return await _reply(
+                interaction,
                 "This challenge could not be declined cleanly. Please ask a moderator for help.",
-                ephemeral=True,
             )
 
         cancel_challenge_expiry_task(self.match_id)
@@ -368,15 +515,16 @@ class MatchStartView(discord.ui.View):
                 ephemeral=True,
             )
 
+        await interaction.response.defer()
         async with get_db_pool().acquire() as conn:
             async with conn.transaction():
                 match = await lock_match(conn, self.match_id)
                 if not match:
-                    return await interaction.response.send_message("This match no longer exists.", ephemeral=True)
+                    return await _reply(interaction, "This match no longer exists.")
                 if match["status"] != "ACCEPTED":
-                    return await interaction.response.send_message(
+                    return await _reply(
+                        interaction,
                         f"This match cannot be started right now (current: {match['status']}).",
-                        ephemeral=True,
                     )
 
                 started = await conn.fetchrow(
@@ -390,11 +538,10 @@ class MatchStartView(discord.ui.View):
                     self.match_id,
                 )
                 if not started:
-                    return await interaction.response.send_message(
-                        "This match cannot be started right now.",
-                        ephemeral=True,
-                    )
+                    return await _reply(interaction, "This match cannot be started right now.")
 
+        cancel_accepted_expiry_task(self.match_id)
+        schedule_active_expiry(self.match_id)
         challenger = await get_bot().fetch_user(self.challenger_id)
         opponent = await get_bot().fetch_user(self.opponent_id)
         embed = discord.Embed(
@@ -561,6 +708,7 @@ class MatchReportView(discord.ui.View):
         if payout_embed and interaction.channel:
             await interaction.channel.send(embed=payout_embed)
 
+        cancel_all_player_match_expiry_tasks(self.match_id)
         embed = discord.Embed(
             title="⚔️ Match Complete!",
             description=f"{challenger.mention} vs {opponent.mention}",

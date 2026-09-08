@@ -6,6 +6,7 @@ import discord
 
 from bot_helpers import (
     MIN_TEAM_BET,
+    TEAM_MATCH_ACTIVE_TIMEOUT_SECONDS,
     TEAM_MATCH_OPEN_TIMEOUT_SECONDS,
     InsufficientFundsError,
     build_team_match_embed,
@@ -30,13 +31,32 @@ from bot_helpers import (
     update_team_match_message,
 )
 
-_team_expiry_tasks: dict[str, asyncio.Task] = {}
+_team_open_expiry_tasks: dict[str, asyncio.Task] = {}
+_team_active_expiry_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _team_reply(interaction: discord.Interaction, content: str, *, ephemeral: bool = True):
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(content, ephemeral=ephemeral)
 
 
 def cancel_team_match_expiry_task(match_id: str):
-    task = _team_expiry_tasks.pop(match_id, None)
+    task = _team_open_expiry_tasks.pop(match_id, None)
     if task and not task.done():
         task.cancel()
+
+
+def cancel_team_match_active_expiry_task(match_id: str):
+    task = _team_active_expiry_tasks.pop(match_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def cancel_all_team_match_expiry_tasks(match_id: str):
+    cancel_team_match_expiry_task(match_id)
+    cancel_team_match_active_expiry_task(match_id)
 
 
 async def expire_open_team_match(match_id: str) -> bool:
@@ -69,6 +89,36 @@ async def expire_open_team_match(match_id: str) -> bool:
     return True
 
 
+async def expire_active_team_match(match_id: str) -> bool:
+    """Auto-cancel an ACTIVE team match and refund bets after timeout."""
+    cancel_all_team_match_expiry_tasks(match_id)
+    try:
+        async with get_db_pool().acquire() as conn:
+            async with conn.transaction():
+                match = await lock_team_match(conn, match_id)
+                if not match or match["status"] != "ACTIVE":
+                    return False
+                role_one_id = int(match["role_one_id"])
+                role_two_id = int(match["role_two_id"])
+                refunded = await cancel_team_match_with_refunds(conn, match_id)
+    except Exception as e:
+        await log(f"❌ ERROR — Active team match timeout for {match_id}: {e}")
+        return False
+
+    embed = await build_team_match_embed(
+        match_id,
+        role_one_id,
+        role_two_id,
+        "CANCELLED",
+        created_by_text="Cancelled automatically — active match idle too long",
+    )
+    await update_team_match_message(match_id, embed, view=None)
+    await log(
+        f"⏰ TEAM MATCH ACTIVE TIMEOUT — Match ID: {match_id} | Bets refunded: {refunded}"
+    )
+    return True
+
+
 def schedule_team_match_expiry(match_id: str, delay_seconds: float | None = None):
     cancel_team_match_expiry_task(match_id)
     delay = TEAM_MATCH_OPEN_TIMEOUT_SECONDS if delay_seconds is None else max(0.0, delay_seconds)
@@ -80,9 +130,25 @@ def schedule_team_match_expiry(match_id: str, delay_seconds: float | None = None
         except asyncio.CancelledError:
             return
         finally:
-            _team_expiry_tasks.pop(match_id, None)
+            _team_open_expiry_tasks.pop(match_id, None)
 
-    _team_expiry_tasks[match_id] = asyncio.create_task(_runner())
+    _team_open_expiry_tasks[match_id] = asyncio.create_task(_runner())
+
+
+def schedule_team_match_active_expiry(match_id: str, delay_seconds: float | None = None):
+    cancel_team_match_active_expiry_task(match_id)
+    delay = TEAM_MATCH_ACTIVE_TIMEOUT_SECONDS if delay_seconds is None else max(0.0, delay_seconds)
+
+    async def _runner():
+        try:
+            await asyncio.sleep(delay)
+            await expire_active_team_match(match_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            _team_active_expiry_tasks.pop(match_id, None)
+
+    _team_active_expiry_tasks[match_id] = asyncio.create_task(_runner())
 
 
 async def expire_stale_team_matches():
@@ -98,6 +164,22 @@ async def expire_stale_team_matches():
         )
     for row in rows:
         await expire_open_team_match(row["match_id"])
+
+
+async def expire_stale_active_team_matches():
+    cutoff = now_utc() - timedelta(seconds=TEAM_MATCH_ACTIVE_TIMEOUT_SECONDS)
+    async with get_db_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT match_id
+            FROM team_matches
+            WHERE status = 'ACTIVE'
+              AND COALESCE(started_at, created_at) <= $1
+            """,
+            cutoff,
+        )
+    for row in rows:
+        await expire_active_team_match(row["match_id"])
 
 
 class TeamBetModal(discord.ui.Modal):
@@ -128,25 +210,20 @@ class TeamBetModal(discord.ui.Modal):
                 ephemeral=True,
             )
 
+        await interaction.response.defer(ephemeral=True)
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     match = await lock_team_match(conn, self.match_id)
                     if not match:
-                        return await interaction.response.send_message(
-                            "This team match no longer exists.",
-                            ephemeral=True,
-                        )
+                        return await _team_reply(interaction, "This team match no longer exists.")
                     if match["status"] != "OPEN":
-                        return await interaction.response.send_message(
+                        return await _team_reply(
+                            interaction,
                             f"Bets are only open while the match is OPEN (current: {match['status']}).",
-                            ephemeral=True,
                         )
                     if str(self.role_id) not in (match["role_one_id"], match["role_two_id"]):
-                        return await interaction.response.send_message(
-                            "That team is not part of this match.",
-                            ephemeral=True,
-                        )
+                        return await _team_reply(interaction, "That team is not part of this match.")
 
                     await ensure_user(conn, interaction.user.id)
                     existing = await conn.fetchrow(
@@ -158,17 +235,17 @@ class TeamBetModal(discord.ui.Modal):
                         str(interaction.user.id),
                     )
                     if existing:
-                        return await interaction.response.send_message(
+                        return await _team_reply(
+                            interaction,
                             "You already have a bet on this match. Use **Cancel My Bet** first to change it.",
-                            ephemeral=True,
                         )
 
                     bettor_row = await lock_user(conn, interaction.user.id)
                     if not bettor_row or spendable(bettor_row) < amount:
                         available = spendable(bettor_row) if bettor_row else 0
-                        return await interaction.response.send_message(
+                        return await _team_reply(
+                            interaction,
                             f"Insufficient funds. You have {fmt(available)} available.",
-                            ephemeral=True,
                         )
 
                     bet_id = gen_id(5)
@@ -194,15 +271,12 @@ class TeamBetModal(discord.ui.Modal):
                         amount,
                     )
         except asyncpg.UniqueViolationError:
-            return await interaction.response.send_message(
+            return await _team_reply(
+                interaction,
                 "You already have a bet on this match. Use **Cancel My Bet** first to change it.",
-                ephemeral=True,
             )
         except InsufficientFundsError:
-            return await interaction.response.send_message(
-                f"Insufficient funds to bet {fmt(amount)}.",
-                ephemeral=True,
-            )
+            return await _team_reply(interaction, f"Insufficient funds to bet {fmt(amount)}.")
 
         embed = await build_team_match_embed(
             self.match_id,
@@ -220,7 +294,7 @@ class TeamBetModal(discord.ui.Modal):
         )
         get_bot().add_view(open_view)
         await update_team_match_message(self.match_id, embed, view=open_view)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Bet placed: {fmt(amount)} on {await get_role_mention(self.role_id)} for match `{self.match_id}`.",
             ephemeral=True,
         )
@@ -304,14 +378,15 @@ class TeamMatchOpenView(discord.ui.View):
         await interaction.response.send_modal(TeamBetModal(self.match_id, self.role_two_id, label))
 
     async def cancel_my_bet(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     match = await lock_team_match(conn, self.match_id)
                     if not match or match["status"] != "OPEN":
-                        return await interaction.response.send_message(
+                        return await _team_reply(
+                            interaction,
                             "Bets can only be cancelled while the match is OPEN.",
-                            ephemeral=True,
                         )
                     bet = await conn.fetchrow(
                         """
@@ -323,10 +398,7 @@ class TeamMatchOpenView(discord.ui.View):
                         str(interaction.user.id),
                     )
                     if not bet:
-                        return await interaction.response.send_message(
-                            "You don't have an open bet on this match.",
-                            ephemeral=True,
-                        )
+                        return await _team_reply(interaction, "You don't have an open bet on this match.")
                     deleted = await conn.fetchrow(
                         """
                         DELETE FROM team_bets
@@ -336,10 +408,7 @@ class TeamMatchOpenView(discord.ui.View):
                         bet["bet_id"],
                     )
                     if not deleted:
-                        return await interaction.response.send_message(
-                            "You don't have an open bet on this match.",
-                            ephemeral=True,
-                        )
+                        return await _team_reply(interaction, "You don't have an open bet on this match.")
                     await release_escrow(
                         conn,
                         interaction.user.id,
@@ -348,9 +417,9 @@ class TeamMatchOpenView(discord.ui.View):
                         fmt_user(interaction.user),
                     )
         except InsufficientFundsError:
-            return await interaction.response.send_message(
+            return await _team_reply(
+                interaction,
                 "Could not refund your bet cleanly. Please ask a moderator for help.",
-                ephemeral=True,
             )
 
         embed = await build_team_match_embed(
@@ -361,7 +430,7 @@ class TeamMatchOpenView(discord.ui.View):
             created_by_text=f"Created by mod | Match `{self.match_id}`",
         )
         await update_team_match_message(self.match_id, embed, view=self)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Your bet of {fmt(bet['amount'])} was cancelled and refunded.",
             ephemeral=True,
         )
@@ -376,18 +445,16 @@ class TeamMatchOpenView(discord.ui.View):
                 ephemeral=True,
             )
 
+        await interaction.response.defer()
         async with get_db_pool().acquire() as conn:
             async with conn.transaction():
                 match = await lock_team_match(conn, self.match_id)
                 if not match:
-                    return await interaction.response.send_message(
-                        "This team match no longer exists.",
-                        ephemeral=True,
-                    )
+                    return await _team_reply(interaction, "This team match no longer exists.")
                 if match["status"] != "OPEN":
-                    return await interaction.response.send_message(
+                    return await _team_reply(
+                        interaction,
                         f"This match cannot be started (current: {match['status']}).",
-                        ephemeral=True,
                     )
                 started = await conn.fetchrow(
                     """
@@ -400,12 +467,10 @@ class TeamMatchOpenView(discord.ui.View):
                     self.match_id,
                 )
                 if not started:
-                    return await interaction.response.send_message(
-                        "This match could not be started.",
-                        ephemeral=True,
-                    )
+                    return await _team_reply(interaction, "This match could not be started.")
 
         cancel_team_match_expiry_task(self.match_id)
+        schedule_team_match_active_expiry(self.match_id)
         active_view = TeamMatchActiveView(
             self.match_id,
             self.role_one_id,
@@ -422,23 +487,14 @@ class TeamMatchOpenView(discord.ui.View):
             created_by_text=f"Started by {fmt_user(interaction.user)} | Match `{self.match_id}`",
         )
         try:
-            await interaction.response.edit_message(embed=embed, view=active_view)
+            await update_team_match_message(self.match_id, embed, view=active_view)
+            await interaction.followup.send(
+                f"Team match `{self.match_id}` started. Bets are locked.",
+                ephemeral=True,
+            )
         except Exception as e:
             await log(f"⚠️ TEAM UI EDIT FALLBACK — Match ID: {self.match_id} | Error: {e}")
             await update_team_match_message(self.match_id, embed, view=active_view)
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(
-                        f"Team match `{self.match_id}` started. Bets are locked.",
-                        ephemeral=True,
-                    )
-                else:
-                    await interaction.response.send_message(
-                        f"Team match `{self.match_id}` started. Bets are locked.",
-                        ephemeral=True,
-                    )
-            except Exception:
-                pass
         await log(f"🥊 TEAM MATCH STARTED — Match ID: {self.match_id} | By: {fmt_user(interaction.user)}")
 
     async def cancel_match(self, interaction: discord.Interaction):
@@ -448,24 +504,22 @@ class TeamMatchOpenView(discord.ui.View):
                 ephemeral=True,
             )
 
+        await interaction.response.defer()
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     match = await lock_team_match(conn, self.match_id)
                     if not match or match["status"] not in ("OPEN", "ACTIVE"):
-                        return await interaction.response.send_message(
-                            "This match cannot be cancelled right now.",
-                            ephemeral=True,
-                        )
+                        return await _team_reply(interaction, "This match cannot be cancelled right now.")
                     refunded = await cancel_team_match_with_refunds(conn, self.match_id)
         except InsufficientFundsError as e:
             await log(f"❌ ERROR — team match cancel failed for {self.match_id}: {e}")
-            return await interaction.response.send_message(
+            return await _team_reply(
+                interaction,
                 "Could not cancel cleanly because escrow was inconsistent.",
-                ephemeral=True,
             )
 
-        cancel_team_match_expiry_task(self.match_id)
+        cancel_all_team_match_expiry_tasks(self.match_id)
         embed = await build_team_match_embed(
             self.match_id,
             self.role_one_id,
@@ -473,7 +527,7 @@ class TeamMatchOpenView(discord.ui.View):
             "CANCELLED",
             created_by_text=f"Cancelled by {fmt_user(interaction.user)}",
         )
-        await interaction.response.edit_message(embed=embed, view=None)
+        await update_team_match_message(self.match_id, embed, view=None)
         await interaction.followup.send(
             f"Team match `{self.match_id}` cancelled. Refunded **{refunded}** bet(s).",
             ephemeral=True,
@@ -582,7 +636,7 @@ class TeamMatchActiveView(discord.ui.View):
                 ephemeral=True,
             )
 
-        cancel_team_match_expiry_task(self.match_id)
+        cancel_all_team_match_expiry_tasks(self.match_id)
         if payout_embed and interaction.channel:
             await interaction.channel.send(embed=payout_embed)
 
@@ -613,24 +667,22 @@ class TeamMatchActiveView(discord.ui.View):
                 ephemeral=True,
             )
 
+        await interaction.response.defer()
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
                     match = await lock_team_match(conn, self.match_id)
                     if not match or match["status"] != "ACTIVE":
-                        return await interaction.response.send_message(
-                            "This match cannot be cancelled right now.",
-                            ephemeral=True,
-                        )
+                        return await _team_reply(interaction, "This match cannot be cancelled right now.")
                     refunded = await cancel_team_match_with_refunds(conn, self.match_id)
         except InsufficientFundsError as e:
             await log(f"❌ ERROR — team match cancel failed for {self.match_id}: {e}")
-            return await interaction.response.send_message(
+            return await _team_reply(
+                interaction,
                 "Could not cancel cleanly because escrow was inconsistent.",
-                ephemeral=True,
             )
 
-        cancel_team_match_expiry_task(self.match_id)
+        cancel_all_team_match_expiry_tasks(self.match_id)
         embed = await build_team_match_embed(
             self.match_id,
             self.role_one_id,
@@ -638,7 +690,7 @@ class TeamMatchActiveView(discord.ui.View):
             "CANCELLED",
             created_by_text=f"Cancelled by {fmt_user(interaction.user)}",
         )
-        await interaction.response.edit_message(embed=embed, view=None)
+        await update_team_match_message(self.match_id, embed, view=None)
         await interaction.followup.send(
             f"Team match `{self.match_id}` cancelled. Refunded **{refunded}** bet(s).",
             ephemeral=True,
@@ -670,17 +722,24 @@ async def restore_team_match_views():
             schedule_team_match_expiry(match_id, remaining)
 
     for match in active_matches:
+        match_id = match["match_id"]
         role_one_id = int(match["role_one_id"])
         role_two_id = int(match["role_two_id"])
         bot.add_view(
             TeamMatchActiveView(
-                match["match_id"],
+                match_id,
                 role_one_id,
                 role_two_id,
                 resolve_role_label(role_one_id, "Team 1"),
                 resolve_role_label(role_two_id, "Team 2"),
             )
         )
+        anchor = match["started_at"] or match["created_at"]
+        remaining = TEAM_MATCH_ACTIVE_TIMEOUT_SECONDS - (now - anchor).total_seconds()
+        if remaining <= 0:
+            await expire_active_team_match(match_id)
+        else:
+            schedule_team_match_active_expiry(match_id, remaining)
 
     if open_matches or active_matches:
         await log(
