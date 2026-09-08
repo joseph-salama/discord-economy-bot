@@ -15,7 +15,6 @@ from bot_helpers import (
     build_open_matches_embed,
     build_top_embed,
     cancel_match_if_pending,
-    complete_match_if_active,
     debit_escrow,
     enforce_channel,
     ensure_user,
@@ -32,6 +31,7 @@ from bot_helpers import (
     lock_users_ordered,
     log,
     now_utc,
+    propose_or_confirm_winner,
     release_escrow,
     release_escrow_up_to,
     run_payout,
@@ -60,8 +60,8 @@ def register_commands(bot: discord.Bot):
             commands_list = [
                 "**/battle** — Challenge another player to a battle.",
                 "**/start** — Start an accepted match.",
-                "**/report** — Report the winner of your active match.",
-                "**/bet** — Bet on a player in an accepted match.",
+                "**/report** — Propose/confirm the winner (both players must agree).",
+                "**/bet** — Bet on a player in an accepted match (pari-mutuel pool).",
                 "**/balance** — Check your balance or another user's balance.",
                 f"**/give** — Give some of your {CURRENCY_NAME} to another user.",
                 f"**/daily** — Claim your daily {fmt(DAILY_AMOUNT)} {CURRENCY_NAME}.",
@@ -286,7 +286,7 @@ def register_commands(bot: discord.Bot):
             )
             embed.add_field(
                 name="Report Winner",
-                value="One of the two players can press the winner button on the match message below when the match is over.",
+                value="Both players must report the **same** winner (buttons or `/report`). A moderator can still `/resolve`.",
                 inline=False,
             )
             report_view = await MatchReportView.create(match_id, int(match["challenger_id"]), int(match["opponent_id"]))
@@ -299,7 +299,7 @@ def register_commands(bot: discord.Bot):
             await ctx.respond("Something went wrong.", ephemeral=True)
             await log(f"❌ ERROR — Command: /start | User: {fmt_user(ctx.author)} | Error: {traceback.format_exc()}")
 
-    @bot.slash_command(description="Report the winner of your match")
+    @bot.slash_command(description="Propose or confirm the winner of your match (both players must agree)")
     @option("match_id", str, description="The match ID")
     @option("winner", discord.Member, description="The winner of the match")
     async def report(ctx: discord.ApplicationContext, match_id: str, winner: discord.Member):
@@ -309,41 +309,97 @@ def register_commands(bot: discord.Bot):
             match_id = match_id.upper()
             await ctx.defer()
             payout_embed = None
+            result = None
             try:
                 async with get_db_pool().acquire() as conn:
                     async with conn.transaction():
                         await ensure_user(conn, ctx.author.id)
-                        match = await lock_match(conn, match_id)
-                        if not match:
-                            return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
-                        if str(ctx.author.id) not in (match["challenger_id"], match["opponent_id"]):
-                            return await ctx.followup.send("You are not a participant in this match.", ephemeral=True)
-                        if match["status"] != "ACTIVE":
-                            return await ctx.followup.send(
-                                f"Match `{match_id}` is not ACTIVE (current: {match['status']}).",
-                                ephemeral=True,
+                        try:
+                            result, completed = await propose_or_confirm_winner(
+                                conn,
+                                match_id,
+                                str(winner.id),
+                                str(ctx.author.id),
                             )
-                        if str(winner.id) not in (match["challenger_id"], match["opponent_id"]):
-                            return await ctx.followup.send("The winner must be one of the two players.", ephemeral=True)
+                        except ValueError as e:
+                            code = str(e)
+                            if code == "missing_match":
+                                return await ctx.followup.send(f"Match `{match_id}` not found.", ephemeral=True)
+                            if code == "bad_reporter":
+                                return await ctx.followup.send(
+                                    "You are not a participant in this match.",
+                                    ephemeral=True,
+                                )
+                            if code.startswith("bad_status:"):
+                                status = code.split(":", 1)[1]
+                                return await ctx.followup.send(
+                                    f"Match `{match_id}` is not ACTIVE (current: {status}).",
+                                    ephemeral=True,
+                                )
+                            if code == "bad_winner":
+                                return await ctx.followup.send(
+                                    "The winner must be one of the two players.",
+                                    ephemeral=True,
+                                )
+                            if code == "race_completed":
+                                return await ctx.followup.send(
+                                    f"Match `{match_id}` was already completed by someone else.",
+                                    ephemeral=True,
+                                )
+                            return await ctx.followup.send("Could not process that winner report.", ephemeral=True)
 
-                        completed = await complete_match_if_active(
-                            conn,
-                            match_id,
-                            str(winner.id),
-                            str(ctx.author.id),
-                        )
-                        if not completed:
-                            return await ctx.followup.send(
-                                f"Match `{match_id}` was already completed by someone else.",
-                                ephemeral=True,
-                            )
-                        payout_embed = await run_payout(conn, match_id, str(winner.id))
+                        if result == "confirmed" and completed:
+                            payout_embed = await run_payout(conn, match_id, str(winner.id))
             except InsufficientFundsError as e:
                 await log(f"❌ ERROR — /report payout failed for {match_id}: {e}")
                 return await ctx.followup.send(
                     "Payout failed because escrowed funds were inconsistent. Please ask a moderator to use `/resolve`.",
                     ephemeral=True,
                 )
+
+            if result != "confirmed":
+                if result == "disputed":
+                    note = (
+                        f"You proposed a different winner ({winner.mention}). "
+                        "Waiting for the other player to confirm the same winner, or a mod `/resolve`."
+                    )
+                elif result == "waiting":
+                    note = f"You already proposed {winner.mention}. Waiting for the other player to confirm."
+                elif result == "updated":
+                    note = f"Updated your proposal to {winner.mention}. Waiting for the other player to confirm."
+                else:
+                    note = (
+                        f"Proposed {winner.mention} as the winner. "
+                        "Waiting for the other player to confirm the same result."
+                    )
+
+                pending_embed = discord.Embed(
+                    title="🥊 Match Report Pending",
+                    description=note,
+                    color=discord.Color.orange(),
+                )
+                pending_embed.add_field(name="Match ID", value=match_id, inline=True)
+                pending_embed.add_field(name="Proposed Winner", value=winner.mention, inline=True)
+                pending_embed.add_field(name="Status", value="**ACTIVE** — awaiting confirmation", inline=True)
+                async with get_db_pool().acquire() as conn:
+                    match = await conn.fetchrow(
+                        "SELECT challenger_id, opponent_id FROM matches WHERE match_id = $1",
+                        match_id,
+                    )
+                if match:
+                    view = await MatchReportView.create(
+                        match_id,
+                        int(match["challenger_id"]),
+                        int(match["opponent_id"]),
+                    )
+                    get_bot().add_view(view)
+                    await update_match_message(match_id, pending_embed, view=view)
+                await ctx.followup.send(note)
+                await log(
+                    f"📝 MATCH REPORT PROPOSED — Match ID: {match_id} | By: {fmt_user(ctx.author)} | "
+                    f"Winner: {fmt_user(winner)} | Result: {result}"
+                )
+                return
 
             if payout_embed:
                 await ctx.channel.send(embed=payout_embed)
@@ -357,7 +413,7 @@ def register_commands(bot: discord.Bot):
             complete_embed.add_field(name="Status", value="**COMPLETED**", inline=True)
             await update_match_message(match_id, complete_embed, view=None)
 
-            await ctx.followup.send(f"Match `{match_id}` has been completed!", ephemeral=True)
+            await ctx.followup.send(f"Match `{match_id}` has been completed!")
 
         except Exception:
             if ctx.response.is_done():

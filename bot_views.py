@@ -11,7 +11,6 @@ from bot_helpers import (
     build_accepted_match_embed,
     build_top_embed,
     cancel_match_if_pending,
-    complete_match_if_active,
     debit_escrow,
     ensure_user,
     fmt,
@@ -23,6 +22,7 @@ from bot_helpers import (
     lock_user,
     log,
     now_utc,
+    propose_or_confirm_winner,
     release_escrow,
     release_escrow_up_to,
     resolve_user_label,
@@ -406,7 +406,7 @@ class MatchStartView(discord.ui.View):
         embed.add_field(name="Status", value="**ACTIVE**", inline=True)
         embed.add_field(
             name="Report Winner",
-            value="One of the two players can press the winner button below when the match is over.",
+            value="Both players must report the **same** winner. A moderator can still `/resolve`.",
             inline=False,
         )
 
@@ -465,35 +465,49 @@ class MatchReportView(discord.ui.View):
 
     async def complete_match(self, interaction: discord.Interaction, winner_id: int):
         if interaction.user.id not in (self.challenger_id, self.opponent_id):
-            return await interaction.response.send_message("Only one of the two players can report the winner.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Only one of the two players can report the winner.",
+                ephemeral=True,
+            )
 
         await interaction.response.defer()
         payout_embed = None
+        result = None
         try:
             async with get_db_pool().acquire() as conn:
                 async with conn.transaction():
-                    match = await lock_match(conn, self.match_id)
-                    if not match:
-                        return await interaction.followup.send("This match no longer exists.", ephemeral=True)
-                    if match["status"] != "ACTIVE":
+                    try:
+                        result, completed = await propose_or_confirm_winner(
+                            conn,
+                            self.match_id,
+                            str(winner_id),
+                            str(interaction.user.id),
+                        )
+                    except ValueError as e:
+                        code = str(e)
+                        if code == "missing_match":
+                            return await interaction.followup.send(
+                                "This match no longer exists.",
+                                ephemeral=True,
+                            )
+                        if code.startswith("bad_status:"):
+                            status = code.split(":", 1)[1]
+                            return await interaction.followup.send(
+                                f"This match is not active right now (current: {status}).",
+                                ephemeral=True,
+                            )
+                        if code == "race_completed":
+                            return await interaction.followup.send(
+                                "This match was already completed by someone else.",
+                                ephemeral=True,
+                            )
                         return await interaction.followup.send(
-                            f"This match is not active right now (current: {match['status']}).",
+                            "Could not process that winner report.",
                             ephemeral=True,
                         )
 
-                    completed = await complete_match_if_active(
-                        conn,
-                        self.match_id,
-                        str(winner_id),
-                        str(interaction.user.id),
-                    )
-                    if not completed:
-                        return await interaction.followup.send(
-                            "This match was already completed by someone else.",
-                            ephemeral=True,
-                        )
-
-                    payout_embed = await run_payout(conn, self.match_id, str(winner_id))
+                    if result == "confirmed" and completed:
+                        payout_embed = await run_payout(conn, self.match_id, str(winner_id))
         except InsufficientFundsError as e:
             await log(f"❌ ERROR — Match report payout failed for {self.match_id}: {e}")
             return await interaction.followup.send(
@@ -501,12 +515,52 @@ class MatchReportView(discord.ui.View):
                 ephemeral=True,
             )
 
-        if payout_embed and interaction.channel:
-            await interaction.channel.send(embed=payout_embed)
-
         winner_user = await get_bot().fetch_user(winner_id)
         challenger = await get_bot().fetch_user(self.challenger_id)
         opponent = await get_bot().fetch_user(self.opponent_id)
+
+        if result != "confirmed":
+            waiting_for = opponent if interaction.user.id == self.challenger_id else challenger
+            if result == "disputed":
+                note = (
+                    f"{interaction.user.mention} proposed a different winner ({winner_user.mention}). "
+                    f"Waiting for {waiting_for.mention} to confirm the same winner, or a mod `/resolve`."
+                )
+            elif result == "waiting":
+                note = (
+                    f"You already proposed {winner_user.mention}. "
+                    f"Waiting for {waiting_for.mention} to confirm."
+                )
+            elif result == "updated":
+                note = (
+                    f"{interaction.user.mention} updated their proposal to {winner_user.mention}. "
+                    f"Waiting for {waiting_for.mention} to confirm."
+                )
+            else:
+                note = (
+                    f"{interaction.user.mention} proposed {winner_user.mention} as the winner. "
+                    f"Waiting for {waiting_for.mention} to confirm the same result."
+                )
+
+            embed = discord.Embed(
+                title="🥊 Match Report Pending",
+                description=f"{challenger.mention} vs {opponent.mention}\n\n{note}",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(name="Match ID", value=self.match_id, inline=True)
+            embed.add_field(name="Proposed Winner", value=winner_user.mention, inline=True)
+            embed.add_field(name="Status", value="**ACTIVE** — awaiting confirmation", inline=True)
+            await update_match_message(self.match_id, embed, view=self)
+            await interaction.followup.send(note, ephemeral=True)
+            await log(
+                f"📝 MATCH REPORT PROPOSED — Match ID: {self.match_id} | By: {fmt_user(interaction.user)} | "
+                f"Winner: {fmt_user(winner_user)} | Result: {result}"
+            )
+            return
+
+        if payout_embed and interaction.channel:
+            await interaction.channel.send(embed=payout_embed)
+
         embed = discord.Embed(
             title="⚔️ Match Complete!",
             description=f"{challenger.mention} vs {opponent.mention}",
